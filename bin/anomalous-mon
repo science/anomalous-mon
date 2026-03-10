@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# anomalous-mon — Desktop anomaly monitor
+#
+# Monitors for sustained CPU hogging and OOM kills on a Linux workstation.
+# Designed to run as a systemd user timer (every 60s).
+#
+# Usage:
+#   anomalous-mon           Run one monitoring cycle
+#   anomalous-mon --status  Show current tracking state
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Load configuration
+source "$PROJECT_DIR/etc/anomalous-mon.conf"
+
+# Load libraries
+source "$PROJECT_DIR/lib/notify.sh"
+source "$PROJECT_DIR/lib/cpu-monitor.sh"
+source "$PROJECT_DIR/lib/journal-monitor.sh"
+
+# Runtime state files
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+CPU_STATE_FILE="${STATE_DIR}/anomalous-mon.state"
+JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
+
+# Handle --status
+if [[ "${1:-}" == "--status" ]]; then
+    cpu_status "$CPU_STATE_FILE"
+    echo ""
+    if [[ -f "$JOURNAL_CURSOR_FILE" ]]; then
+        echo "Journal cursor: $(cat "$JOURNAL_CURSOR_FILE")"
+    else
+        echo "Journal cursor: none (will scan recent window on next run)"
+    fi
+    exit 0
+fi
+
+# Run one monitoring cycle
+cpu_sample "$CPU_STATE_FILE" "$CPU_THRESHOLD"
+cpu_check_alerts "$CPU_STATE_FILE" "$CPU_SUSTAINED_CYCLES"
+journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK"
