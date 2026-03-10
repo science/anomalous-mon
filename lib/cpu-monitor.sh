@@ -6,19 +6,23 @@
 #   cpu_check_alerts STATE_FILE THRESHOLD SUSTAINED_CYCLES
 #
 # State file format (line-based, one entry per line):
-#   pid:<PID>:<NAME>:<COUNT>:<ALERTED>
+#   pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>
 #   name:<NAME>:<COUNT>:<ALERTED>
 #
 # The ps sampling function can be overridden for testing by setting
 # _CPU_SAMPLE_CMD to a function or command that outputs ps-style lines:
-#   PID %CPU COMM
+#   PID %CPU COMM ARGS...
+#
+# ARGS (full command line) is optional and used only for logging context.
 
 # Default: sample real processes
 _cpu_sample_cmd() {
-    ps -eo pid=,pcpu=,comm= --sort=-pcpu 2>/dev/null \
-        | grep -v -w 'ps' \
-        | grep -v 'anomalous-mon' \
-        | head -20 \
+    local my_pid=$$ my_ppid
+    my_ppid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+
+    ps -eo pid=,pcpu=,comm=,args= --sort=-pcpu 2>/dev/null \
+        | awk -v mypid="$my_pid" -v myppid="$my_ppid" \
+            '$1 != mypid && $1 != myppid && $3 != "ps" { print; count++ } count >= 20 { exit }' \
         || true
 }
 
@@ -27,27 +31,40 @@ _cpu_sample_cmd() {
 _load_state() {
     local state_file="$1"
 
-    declare -gA _PID_COUNT _PID_NAME _PID_ALERTED _NAME_COUNT _NAME_ALERTED
+    declare -gA _PID_COUNT _PID_NAME _PID_ALERTED _PID_ARGS _NAME_COUNT _NAME_ALERTED
 
     # Clear arrays
     _PID_COUNT=()
     _PID_NAME=()
     _PID_ALERTED=()
+    _PID_ARGS=()
     _NAME_COUNT=()
     _NAME_ALERTED=()
 
     [[ -f "$state_file" ]] || return 0
 
-    while IFS=: read -r type f1 f2 f3 f4; do
-        case "$type" in
-            pid)
-                _PID_COUNT[$f1]="$f3"
-                _PID_NAME[$f1]="$f2"
-                _PID_ALERTED[$f1]="$f4"
+    while IFS= read -r line; do
+        case "$line" in
+            pid:*)
+                # pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>
+                local rest="${line#pid:}"
+                local f_pid="${rest%%:*}"; rest="${rest#*:}"
+                local f_name="${rest%%:*}"; rest="${rest#*:}"
+                local f_count="${rest%%:*}"; rest="${rest#*:}"
+                local f_alerted="${rest%%:*}"; rest="${rest#*:}"
+                local f_args="$rest"
+                _PID_COUNT[$f_pid]="$f_count"
+                _PID_NAME[$f_pid]="$f_name"
+                _PID_ALERTED[$f_pid]="$f_alerted"
+                _PID_ARGS[$f_pid]="$f_args"
                 ;;
-            name)
-                _NAME_COUNT[$f1]="$f2"
-                _NAME_ALERTED[$f1]="$f3"
+            name:*)
+                local rest="${line#name:}"
+                local f_name="${rest%%:*}"; rest="${rest#*:}"
+                local f_count="${rest%%:*}"; rest="${rest#*:}"
+                local f_alerted="$rest"
+                _NAME_COUNT[$f_name]="$f_count"
+                _NAME_ALERTED[$f_name]="$f_alerted"
                 ;;
         esac
     done < "$state_file" 2>/dev/null
@@ -60,7 +77,7 @@ _save_state() {
 
     {
         for pid in "${!_PID_COUNT[@]}"; do
-            echo "pid:${pid}:${_PID_NAME[$pid]}:${_PID_COUNT[$pid]}:${_PID_ALERTED[$pid]}"
+            echo "pid:${pid}:${_PID_NAME[$pid]}:${_PID_COUNT[$pid]}:${_PID_ALERTED[$pid]}:${_PID_ARGS[$pid]:-}"
         done
         for name in "${!_NAME_COUNT[@]}"; do
             echo "name:${name}:${_NAME_COUNT[$name]}:${_NAME_ALERTED[$name]}"
@@ -79,13 +96,13 @@ cpu_sample() {
     _load_state "$state_file"
 
     # Track which PIDs and names are hot this cycle
-    declare -A hot_pids hot_names
+    declare -A hot_pids hot_names hot_pid_args
 
     # Get current CPU snapshot
     local sample
     sample="$(${_CPU_SAMPLE_CMD:-_cpu_sample_cmd})"
 
-    while read -r pid pcpu comm; do
+    while read -r pid pcpu comm args; do
         [[ -z "$pid" ]] && continue
         # Remove any decimal from pcpu for integer comparison
         local pcpu_int="${pcpu%%.*}"
@@ -93,6 +110,7 @@ cpu_sample() {
 
         if (( pcpu_int >= threshold )); then
             hot_pids[$pid]="$comm"
+            hot_pid_args[$pid]="${args:-$comm}"
             hot_names[$comm]=1
         fi
     done <<< "$sample"
@@ -109,6 +127,7 @@ cpu_sample() {
         fi
 
         _PID_NAME[$pid]="$current_name"
+        _PID_ARGS[$pid]="${hot_pid_args[$pid]:-$current_name}"
         _PID_COUNT[$pid]=$(( ${_PID_COUNT[$pid]:-0} + 1 ))
         # Preserve alerted state
         _PID_ALERTED[$pid]="${_PID_ALERTED[$pid]:-0}"
@@ -121,7 +140,7 @@ cpu_sample() {
             if [[ "${_PID_ALERTED[$pid]:-0}" == "1" ]]; then
                 clear_alert "pid:${pid}"
             fi
-            unset '_PID_COUNT[$pid]' '_PID_NAME[$pid]' '_PID_ALERTED[$pid]'
+            unset '_PID_COUNT[$pid]' '_PID_NAME[$pid]' '_PID_ALERTED[$pid]' '_PID_ARGS[$pid]'
         fi
     done
 
@@ -157,8 +176,9 @@ cpu_check_alerts() {
     for pid in "${!_PID_COUNT[@]}"; do
         if (( _PID_COUNT[$pid] >= sustained_cycles )) && [[ "${_PID_ALERTED[$pid]}" != "1" ]]; then
             local name="${_PID_NAME[$pid]}"
+            local args="${_PID_ARGS[$pid]:-$name}"
             send_alert "cpu" "pid:${pid}" \
-                "PID ${pid} (${name}) sustained high CPU for ${sustained_cycles} cycles"
+                "PID ${pid} (${name}) sustained high CPU for ${sustained_cycles} cycles: ${args}"
             _PID_ALERTED[$pid]=1
             alerted=1
         fi
@@ -202,7 +222,7 @@ cpu_status() {
         for pid in "${!_PID_COUNT[@]}"; do
             local flag=""
             [[ "${_PID_ALERTED[$pid]}" == "1" ]] && flag=" [ALERTED]"
-            echo "  PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]} cycles${flag}"
+            echo "  PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]} cycles${flag} — ${_PID_ARGS[$pid]:-}"
         done
     fi
 

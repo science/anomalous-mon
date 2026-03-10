@@ -49,7 +49,7 @@ if (( ${#_PID_COUNT[@]} > 0 || ${#_NAME_COUNT[@]} > 0 )); then
     for pid in "${!_PID_COUNT[@]}"; do
         local_flag=""
         [[ "${_PID_ALERTED[$pid]:-0}" == "1" ]] && local_flag=" ALERTED"
-        echo "[tracking] PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag}"
+        echo "[tracking] PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag} — ${_PID_ARGS[$pid]:-}"
     done
     for name in "${!_NAME_COUNT[@]}"; do
         local_flag=""
