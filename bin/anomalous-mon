@@ -48,12 +48,15 @@ _load_state "$CPU_STATE_FILE"
 if (( ${#_PID_COUNT[@]} > 0 || ${#_NAME_COUNT[@]} > 0 )); then
     for pid in "${!_PID_COUNT[@]}"; do
         local_flag=""
+        local_name="${_PID_NAME[$pid]}"
+        local_cycles="$(_get_sustained_cycles "$local_name" "$CPU_SUSTAINED_CYCLES")"
         [[ "${_PID_ALERTED[$pid]:-0}" == "1" ]] && local_flag=" ALERTED"
-        echo "[tracking] PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag} — ${_PID_ARGS[$pid]:-}"
+        echo "[tracking] PID ${pid} (${local_name}): ${_PID_COUNT[$pid]}/${local_cycles} cycles${local_flag} — ${_PID_ARGS[$pid]:-}"
     done
     for name in "${!_NAME_COUNT[@]}"; do
         local_flag=""
+        local_cycles="$(_get_sustained_cycles "$name" "$CPU_SUSTAINED_CYCLES")"
         [[ "${_NAME_ALERTED[$name]:-0}" == "1" ]] && local_flag=" ALERTED"
-        echo "[tracking] name '${name}': ${_NAME_COUNT[$name]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag}"
+        echo "[tracking] name '${name}': ${_NAME_COUNT[$name]}/${local_cycles} cycles${local_flag}"
     done
 fi

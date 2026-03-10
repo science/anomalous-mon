@@ -2,28 +2,40 @@
 # cpu-monitor.sh — CPU sampling and dual-track state tracking
 #
 # Sourced by anomalous-mon. Provides:
-#   cpu_sample STATE_FILE
-#   cpu_check_alerts STATE_FILE THRESHOLD SUSTAINED_CYCLES
+#   cpu_sample STATE_FILE THRESHOLD
+#   cpu_check_alerts STATE_FILE SUSTAINED_CYCLES
 #
 # State file format (line-based, one entry per line):
 #   pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>
 #   name:<NAME>:<COUNT>:<ALERTED>
 #
-# The ps sampling function can be overridden for testing by setting
-# _CPU_SAMPLE_CMD to a function or command that outputs ps-style lines:
-#   PID %CPU COMM ARGS...
+# Uses pidstat (sysstat) for interval-based CPU measurement instead of
+# ps %CPU (which is a lifetime average and misses recent spikes).
 #
-# ARGS (full command line) is optional and used only for logging context.
+# The sampling function can be overridden for testing by setting
+# _CPU_SAMPLE_CMD to a function that outputs lines:
+#   PID %CPU COMM ARGS...
 
-# Default: sample real processes
+# Default: sample real processes via pidstat (1-second interval)
 _cpu_sample_cmd() {
-    ps -eo pid=,pcpu=,comm=,args= --sort=-pcpu 2>/dev/null \
-        | awk '{ print; count++ } count >= 20 { exit }' \
+    # pidstat output: timestamp UID PID %usr %system %guest %wait %CPU CPU Command
+    # We want: PID %CPU COMM ARGS
+    pidstat -l 1 1 2>/dev/null \
+        | awk '/^Average:/ { exit } NR>3 && /^[0-9]/ && $9+0 > 0 {
+            pid=$4; cpu=$9; cmd=$11
+            # Extract bare command name (basename, no path)
+            n=split(cmd, parts, "/")
+            comm=parts[n]
+            # Full command line is field 11 onward
+            args=""
+            for(i=11;i<=NF;i++) args=args (i>11?" ":"") $i
+            print pid, cpu, comm, args
+        }' \
         || true
 }
 
 # Parse state file into associative arrays.
-# Populates: _PID_COUNT, _PID_NAME, _PID_ALERTED, _NAME_COUNT, _NAME_ALERTED
+# Populates: _PID_COUNT, _PID_NAME, _PID_ALERTED, _PID_ARGS, _NAME_COUNT, _NAME_ALERTED
 _load_state() {
     local state_file="$1"
 
@@ -81,6 +93,22 @@ _save_state() {
     } > "$tmp"
 
     mv "$tmp" "$state_file"
+}
+
+# Get the sustained cycles threshold for a given process name.
+# Uses CPU_SUSTAINED_OVERRIDES if set, otherwise falls back to default.
+_get_sustained_cycles() {
+    local name="$1"
+    local default="$2"
+
+    if declare -p CPU_SUSTAINED_OVERRIDES &>/dev/null; then
+        local override="${CPU_SUSTAINED_OVERRIDES[$name]+${CPU_SUSTAINED_OVERRIDES[$name]}}"
+        if [[ -n "$override" ]]; then
+            echo "$override"
+            return
+        fi
+    fi
+    echo "$default"
 }
 
 # Take a CPU sample and update state.
@@ -160,21 +188,23 @@ cpu_sample() {
 }
 
 # Check state and fire alerts for anything that has sustained high CPU.
-# Args: $1=state_file, $2=sustained_cycles
+# Args: $1=state_file, $2=default_sustained_cycles
 cpu_check_alerts() {
     local state_file="$1"
-    local sustained_cycles="$2"
+    local default_cycles="$2"
     local alerted=0
 
     _load_state "$state_file"
 
     # Check PID table
     for pid in "${!_PID_COUNT[@]}"; do
-        if (( _PID_COUNT[$pid] >= sustained_cycles )) && [[ "${_PID_ALERTED[$pid]}" != "1" ]]; then
-            local name="${_PID_NAME[$pid]}"
+        local name="${_PID_NAME[$pid]}"
+        local cycles
+        cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
+        if (( _PID_COUNT[$pid] >= cycles )) && [[ "${_PID_ALERTED[$pid]}" != "1" ]]; then
             local args="${_PID_ARGS[$pid]:-$name}"
             send_alert "cpu" "pid:${pid}" \
-                "PID ${pid} (${name}) sustained high CPU for ${sustained_cycles} cycles: ${args}"
+                "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args}"
             _PID_ALERTED[$pid]=1
             alerted=1
         fi
@@ -182,9 +212,11 @@ cpu_check_alerts() {
 
     # Check Name table
     for name in "${!_NAME_COUNT[@]}"; do
-        if (( _NAME_COUNT[$name] >= sustained_cycles )) && [[ "${_NAME_ALERTED[$name]}" != "1" ]]; then
+        local cycles
+        cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
+        if (( _NAME_COUNT[$name] >= cycles )) && [[ "${_NAME_ALERTED[$name]}" != "1" ]]; then
             send_alert "cpu" "name:${name}" \
-                "Process '${name}' sustained high CPU for ${sustained_cycles} cycles"
+                "Process '${name}' sustained high CPU for ${_NAME_COUNT[$name]} cycles"
             _NAME_ALERTED[$name]=1
             alerted=1
         fi
@@ -213,21 +245,28 @@ cpu_status() {
         return
     fi
 
+    local default_cycles="${CPU_SUSTAINED_CYCLES:-5}"
+
     if (( ${#_PID_COUNT[@]} > 0 )); then
         echo "PID table:"
         for pid in "${!_PID_COUNT[@]}"; do
+            local name="${_PID_NAME[$pid]}"
+            local cycles
+            cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
             local flag=""
             [[ "${_PID_ALERTED[$pid]}" == "1" ]] && flag=" [ALERTED]"
-            echo "  PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]} cycles${flag} — ${_PID_ARGS[$pid]:-}"
+            echo "  PID ${pid} (${name}): ${_PID_COUNT[$pid]}/${cycles} cycles${flag} — ${_PID_ARGS[$pid]:-}"
         done
     fi
 
     if (( ${#_NAME_COUNT[@]} > 0 )); then
         echo "Name table:"
         for name in "${!_NAME_COUNT[@]}"; do
+            local cycles
+            cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
             local flag=""
             [[ "${_NAME_ALERTED[$name]}" == "1" ]] && flag=" [ALERTED]"
-            echo "  ${name}: ${_NAME_COUNT[$name]} cycles${flag}"
+            echo "  ${name}: ${_NAME_COUNT[$name]}/${cycles} cycles${flag}"
         done
     fi
 }

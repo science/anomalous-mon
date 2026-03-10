@@ -249,6 +249,31 @@ else
     test_result "Deduplication: alerted process doesn't re-alert while still hot" "fail"
 fi
 
+# --- Per-process sustained cycles override ---
+reset_test_state
+declare -gA CPU_SUSTAINED_OVERRIDES=([slowburn]=10)
+set_mock_ps "1234 50.0 slowburn"
+for i in {1..5}; do
+    cpu_sample "$TEST_TMP/cpu.state" 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Per-process override: 5 cycles not enough when override is 10" "pass"
+else
+    test_result "Per-process override: 5 cycles not enough when override is 10" "fail"
+fi
+# Continue to 10 cycles
+for i in {1..5}; do
+    cpu_sample "$TEST_TMP/cpu.state" 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if [[ "$ALERT_LOG" == *"slowburn"* ]]; then
+    test_result "Per-process override: alerts after reaching override threshold (10)" "pass"
+else
+    test_result "Per-process override: alerts after reaching override threshold (10)" "fail"
+fi
+unset CPU_SUSTAINED_OVERRIDES
+
 # ── Journal Monitor Tests ─────────────────────────────────────────────
 
 echo ""
