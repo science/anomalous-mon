@@ -18,7 +18,8 @@ _cpu_sample_cmd() {
     ps -eo pid=,pcpu=,comm= --sort=-pcpu 2>/dev/null \
         | grep -v -w 'ps' \
         | grep -v 'anomalous-mon' \
-        | head -20
+        | head -20 \
+        || true
 }
 
 # Parse state file into associative arrays.
