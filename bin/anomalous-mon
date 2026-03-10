@@ -42,3 +42,18 @@ fi
 cpu_sample "$CPU_STATE_FILE" "$CPU_THRESHOLD"
 cpu_check_alerts "$CPU_STATE_FILE" "$CPU_SUSTAINED_CYCLES"
 journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK"
+
+# Log tracking state if anything is being tracked
+_load_state "$CPU_STATE_FILE"
+if (( ${#_PID_COUNT[@]} > 0 || ${#_NAME_COUNT[@]} > 0 )); then
+    for pid in "${!_PID_COUNT[@]}"; do
+        local_flag=""
+        [[ "${_PID_ALERTED[$pid]:-0}" == "1" ]] && local_flag=" ALERTED"
+        echo "[tracking] PID ${pid} (${_PID_NAME[$pid]}): ${_PID_COUNT[$pid]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag}"
+    done
+    for name in "${!_NAME_COUNT[@]}"; do
+        local_flag=""
+        [[ "${_NAME_ALERTED[$name]:-0}" == "1" ]] && local_flag=" ALERTED"
+        echo "[tracking] name '${name}': ${_NAME_COUNT[$name]}/${CPU_SUSTAINED_CYCLES} cycles${local_flag}"
+    done
+fi

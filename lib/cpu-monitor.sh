@@ -15,7 +15,10 @@
 
 # Default: sample real processes
 _cpu_sample_cmd() {
-    ps -eo pid=,pcpu=,comm= --sort=-pcpu 2>/dev/null | head -20
+    ps -eo pid=,pcpu=,comm= --sort=-pcpu 2>/dev/null \
+        | grep -v -w 'ps' \
+        | grep -v 'anomalous-mon' \
+        | head -20
 }
 
 # Parse state file into associative arrays.
