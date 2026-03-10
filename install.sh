@@ -18,11 +18,11 @@ EOF
 
 cat > "$SERVICE_DIR/anomalous-mon.timer" << EOF
 [Unit]
-Description=Run anomalous-mon every 60 seconds
+Description=Run anomalous-mon continuously
 
 [Timer]
-OnBootSec=60
-OnUnitActiveSec=60
+OnBootSec=10
+OnUnitInactiveSec=5
 AccuracySec=5
 
 [Install]

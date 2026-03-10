@@ -16,11 +16,11 @@
 # _CPU_SAMPLE_CMD to a function that outputs lines:
 #   PID %CPU COMM ARGS...
 
-# Default: sample real processes via pidstat (1-second interval)
+# Default: sample real processes via pidstat (60-second interval)
 _cpu_sample_cmd() {
     # pidstat output: timestamp UID PID %usr %system %guest %wait %CPU CPU Command
     # We want: PID %CPU COMM ARGS
-    pidstat -l 1 1 2>/dev/null \
+    pidstat -l 60 1 2>/dev/null \
         | awk '/^Average:/ { exit } NR>3 && /^[0-9]/ && $9+0 > 0 {
             pid=$4; cpu=$9; cmd=$11
             # Extract bare command name (basename, no path)
