@@ -2,8 +2,13 @@
 # cpu-monitor.sh — CPU sampling and dual-track state tracking
 #
 # Sourced by anomalous-mon. Provides:
-#   cpu_sample STATE_FILE THRESHOLD
+#   cpu_sample STATE_FILE PER_CORE_THRESHOLD TOTAL_CPU_THRESHOLD
 #   cpu_check_alerts STATE_FILE SUSTAINED_CYCLES
+#
+# A process is "hot" if it exceeds EITHER threshold:
+#   - PER_CORE_THRESHOLD: pidstat %CPU value (percent of one core)
+#   - TOTAL_CPU_THRESHOLD: percent of total CPU (all cores combined);
+#     converted to pidstat scale internally as TOTAL_CPU_THRESHOLD * nproc
 #
 # State file format (line-based, one entry per line):
 #   pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>
@@ -15,6 +20,8 @@
 # The sampling function can be overridden for testing by setting
 # _CPU_SAMPLE_CMD to a function that outputs lines:
 #   PID %CPU COMM ARGS...
+#
+# _NPROC can be set to override nproc for testing.
 
 # Default: sample real processes via pidstat (60-second interval)
 _cpu_sample_cmd() {
@@ -112,10 +119,15 @@ _get_sustained_cycles() {
 }
 
 # Take a CPU sample and update state.
-# Args: $1=state_file, $2=threshold
+# Args: $1=state_file, $2=per_core_threshold, $3=total_cpu_threshold (% of total)
 cpu_sample() {
     local state_file="$1"
-    local threshold="$2"
+    local per_core_threshold="$2"
+    local total_cpu_pct="${3:-0}"
+
+    # Convert total-CPU percentage to pidstat scale (% of one core * nproc)
+    local nproc_val="${_NPROC:-$(nproc)}"
+    local total_threshold=$(( total_cpu_pct * nproc_val ))
 
     _load_state "$state_file"
 
@@ -132,7 +144,7 @@ cpu_sample() {
         local pcpu_int="${pcpu%%.*}"
         [[ -z "$pcpu_int" ]] && pcpu_int=0
 
-        if (( pcpu_int >= threshold )); then
+        if (( pcpu_int >= per_core_threshold || ( total_threshold > 0 && pcpu_int >= total_threshold ) )); then
             hot_pids[$pid]="$comm"
             hot_pid_args[$pid]="${args:-$comm}"
             hot_names[$comm]=1

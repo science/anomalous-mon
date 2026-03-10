@@ -35,6 +35,9 @@ source "$PROJECT_DIR/lib/notify.sh"
 source "$PROJECT_DIR/lib/cpu-monitor.sh"
 source "$PROJECT_DIR/lib/journal-monitor.sh"
 
+# Override nproc for deterministic total-CPU threshold calculations
+_NPROC=4
+
 # ── Mock helpers ──────────────────────────────────────────────────────
 
 # Capture alerts instead of sending real notifications
@@ -87,7 +90,7 @@ echo ""
 reset_test_state
 set_mock_ps "1234 5.0 bash
 5678 2.0 sshd"
-cpu_sample "$TEST_TMP/cpu.state" 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -z "$ALERT_LOG" ]]; then
     test_result "No processes above threshold → no alert" "pass"
@@ -97,8 +100,8 @@ fi
 
 # --- Process above threshold for 1 cycle → no alert ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "1234 70.0 rclone"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -z "$ALERT_LOG" ]]; then
     test_result "Process above threshold for 1 cycle → no alert" "pass"
@@ -108,9 +111,9 @@ fi
 
 # --- Process above threshold for 5 cycles → alert fires ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone"
+set_mock_ps "1234 70.0 rclone"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"pid:1234"* && "$ALERT_LOG" == *"name:rclone"* ]]; then
@@ -121,16 +124,16 @@ fi
 
 # --- Process drops below threshold → counter resets ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone"
+set_mock_ps "1234 70.0 rclone"
 for i in {1..3}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 # Drop below threshold
 set_mock_ps "1234 5.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 # Back above
-set_mock_ps "1234 50.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "1234 70.0 rclone"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -z "$ALERT_LOG" ]]; then
     test_result "Process drops below threshold → counter resets" "pass"
@@ -140,19 +143,19 @@ fi
 
 # --- Process re-triggers after clearing → new alert fires ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone"
+set_mock_ps "1234 70.0 rclone"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 ALERT_LOG="" # reset log but keep alerted state in state file
 # Drop below
 set_mock_ps "1234 5.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 # Re-trigger
-set_mock_ps "1234 50.0 rclone"
+set_mock_ps "1234 70.0 rclone"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"pid:1234"* ]]; then
@@ -163,10 +166,10 @@ fi
 
 # --- Multiple hot processes → independent tracking ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone
+set_mock_ps "1234 70.0 rclone
 5678 80.0 firefox"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"rclone"* && "$ALERT_LOG" == *"firefox"* ]]; then
@@ -179,8 +182,8 @@ fi
 reset_test_state
 for i in {1..5}; do
     # Different PID each cycle, same name
-    set_mock_ps "$((1000 + i)) 50.0 crasher"
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    set_mock_ps "$((1000 + i)) 70.0 crasher"
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"name:crasher"* ]]; then
@@ -191,14 +194,14 @@ fi
 
 # --- Same PID, name changes → PID table still accumulates ---
 reset_test_state
-set_mock_ps "9999 50.0 starter"
-cpu_sample "$TEST_TMP/cpu.state" 25
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "9999 70.0 starter"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 # Process exec()s into different binary
-set_mock_ps "9999 50.0 worker"
-cpu_sample "$TEST_TMP/cpu.state" 25
-cpu_sample "$TEST_TMP/cpu.state" 25
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "9999 70.0 worker"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"pid:9999"* ]]; then
     test_result "Same PID, name changes → PID table still accumulates" "pass"
@@ -209,8 +212,8 @@ fi
 # --- State file missing (cold start) → starts fresh ---
 reset_test_state
 rm -f "$TEST_TMP/cpu.state"
-set_mock_ps "1234 50.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "1234 70.0 rclone"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 if [[ -f "$TEST_TMP/cpu.state" ]]; then
     test_result "State file missing (cold start) → starts fresh, creates state" "pass"
 else
@@ -220,8 +223,8 @@ fi
 # --- State file corrupt → starts fresh ---
 reset_test_state
 echo "garbage:::corrupt::data" > "$TEST_TMP/cpu.state"
-set_mock_ps "1234 50.0 rclone"
-cpu_sample "$TEST_TMP/cpu.state" 25
+set_mock_ps "1234 70.0 rclone"
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -z "$ALERT_LOG" ]]; then
     test_result "State file corrupt → starts fresh, no crash" "pass"
@@ -231,15 +234,15 @@ fi
 
 # --- Deduplication: same process doesn't spam alerts ---
 reset_test_state
-set_mock_ps "1234 50.0 rclone"
+set_mock_ps "1234 70.0 rclone"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 local_alert_count=$(echo -e "$ALERT_LOG" | grep -c "pid:1234" || true)
 # Run more cycles and check again
 for i in {1..3}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 ALERT_LOG=""
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
@@ -252,9 +255,9 @@ fi
 # --- Per-process sustained cycles override ---
 reset_test_state
 declare -gA CPU_SUSTAINED_OVERRIDES=([slowburn]=10)
-set_mock_ps "1234 50.0 slowburn"
+set_mock_ps "1234 70.0 slowburn"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -z "$ALERT_LOG" ]]; then
@@ -264,7 +267,7 @@ else
 fi
 # Continue to 10 cycles
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ "$ALERT_LOG" == *"slowburn"* ]]; then
@@ -273,6 +276,35 @@ else
     test_result "Per-process override: alerts after reaching override threshold (10)" "fail"
 fi
 unset CPU_SUSTAINED_OVERRIDES
+
+# --- Total-CPU threshold: process below per-core but above total → alert ---
+# With _NPROC=4, total threshold = 25 * 4 = 100 in pidstat terms
+# Process at 40% per-core (below 60%) but imagine higher total scenario:
+# Test with process at 120% (multi-threaded), below per-core in a sense but above total threshold
+reset_test_state
+set_mock_ps "2222 120.0 compiler"
+for i in {1..5}; do
+    cpu_sample "$TEST_TMP/cpu.state" 200 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if [[ "$ALERT_LOG" == *"compiler"* ]]; then
+    test_result "Total-CPU threshold: process above total threshold (120% > 100%) → alert" "pass"
+else
+    test_result "Total-CPU threshold: process above total threshold (120% > 100%) → alert" "fail"
+fi
+
+# --- Total-CPU threshold: process below both thresholds → no alert ---
+reset_test_state
+set_mock_ps "3333 80.0 builder"
+for i in {1..5}; do
+    cpu_sample "$TEST_TMP/cpu.state" 200 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Total-CPU threshold: process below both thresholds (80% < 100%, 80% < 200%) → no alert" "pass"
+else
+    test_result "Total-CPU threshold: process below both thresholds (80% < 100%, 80% < 200%) → no alert" "fail"
+fi
 
 # ── Journal Monitor Tests ─────────────────────────────────────────────
 
@@ -400,7 +432,7 @@ echo ""
 # --- Config file overrides defaults ---
 reset_test_state
 source "$PROJECT_DIR/etc/anomalous-mon.conf"
-if [[ "$CPU_THRESHOLD" == "25" && "$CPU_SUSTAINED_CYCLES" == "5" ]]; then
+if [[ "$CPU_THRESHOLD" == "60" && "$CPU_THRESHOLD_TOTAL" == "25" && "$CPU_SUSTAINED_CYCLES" == "5" ]]; then
     test_result "Config file loads with correct defaults" "pass"
 else
     test_result "Config file loads with correct defaults" "fail"
@@ -410,18 +442,18 @@ fi
 reset_test_state
 set_mock_ps "7777 90.0 runaway"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 first_alert="$ALERT_LOG"
 # Goes cold
 set_mock_ps "7777 1.0 runaway"
-cpu_sample "$TEST_TMP/cpu.state" 25
+cpu_sample "$TEST_TMP/cpu.state" 60 25
 ALERT_LOG=""
 # Re-heats
 set_mock_ps "7777 90.0 runaway"
 for i in {1..5}; do
-    cpu_sample "$TEST_TMP/cpu.state" 25
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
 if [[ -n "$first_alert" && -n "$ALERT_LOG" ]]; then
