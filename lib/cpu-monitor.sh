@@ -17,12 +17,8 @@
 
 # Default: sample real processes
 _cpu_sample_cmd() {
-    local my_pid=$$ my_ppid
-    my_ppid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
-
     ps -eo pid=,pcpu=,comm=,args= --sort=-pcpu 2>/dev/null \
-        | awk -v mypid="$my_pid" -v myppid="$my_ppid" \
-            '$1 != mypid && $1 != myppid && $3 != "ps" { print; count++ } count >= 20 { exit }' \
+        | awk '{ print; count++ } count >= 20 { exit }' \
         || true
 }
 
