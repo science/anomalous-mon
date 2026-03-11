@@ -25,6 +25,7 @@ source "$PROJECT_DIR/lib/journal-monitor.sh"
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 CPU_STATE_FILE="${STATE_DIR}/anomalous-mon.state"
 JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
+JOURNAL_ALERT_FILE="${STATE_DIR}/anomalous-mon.oom-alerts"
 
 # Handle --status
 if [[ "${1:-}" == "--status" ]]; then
@@ -41,7 +42,7 @@ fi
 # Run one monitoring cycle
 cpu_sample "$CPU_STATE_FILE" "$CPU_THRESHOLD" "$CPU_THRESHOLD_TOTAL"
 cpu_check_alerts "$CPU_STATE_FILE" "$CPU_SUSTAINED_CYCLES"
-journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK"
+journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK" "$JOURNAL_ALERT_FILE" "$OOM_COOLDOWN"
 
 # Log tracking state if anything is being tracked
 _load_state "$CPU_STATE_FILE"

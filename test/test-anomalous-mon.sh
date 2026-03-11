@@ -370,6 +370,51 @@ else
     test_result "Journal cursor file missing → scans recent window, no crash" "fail"
 fi
 
+# --- Self-feed filter: own journal entries are ignored ---
+reset_test_state
+_JOURNAL_CMD="_mock_journal_self_feed"
+_mock_journal_self_feed() {
+    # Simulate anomalous-mon's own alert output appearing in the journal
+    echo '{"__CURSOR":"cursor3","MESSAGE":"[ALERT] oom: OOM kill detected: unknown — gdrive-lt.service: Failed with result oom-kill.","_SYSTEMD_USER_UNIT":"anomalous-mon.service"}'
+}
+journal_check "$TEST_TMP/journal.cursor" "2 minutes" "$TEST_TMP/oom.alerts" 1800
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Self-feed filter: own journal entries are ignored" "pass"
+else
+    test_result "Self-feed filter: own journal entries are ignored" "fail"
+fi
+
+# --- OOM cooldown: duplicate OOM within cooldown is suppressed ---
+reset_test_state
+_JOURNAL_CMD="_mock_journal_oom"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes" "$TEST_TMP/oom.alerts" 1800
+first_oom="$ALERT_LOG"
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+rm -f "$TEST_TMP/journal.cursor"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes" "$TEST_TMP/oom.alerts" 1800
+if [[ -n "$first_oom" && -z "$ALERT_LOG" ]]; then
+    test_result "OOM cooldown: duplicate OOM within cooldown is suppressed" "pass"
+else
+    test_result "OOM cooldown: duplicate OOM within cooldown is suppressed" "fail"
+fi
+
+# --- OOM cooldown: alert fires again after cooldown expires ---
+reset_test_state
+_JOURNAL_CMD="_mock_journal_oom"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes" "$TEST_TMP/oom.alerts" 1800
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+rm -f "$TEST_TMP/journal.cursor"
+# Backdate the alert state to simulate cooldown expiry
+sed -i 's/:[0-9]*$/:1000000000/' "$TEST_TMP/oom.alerts"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes" "$TEST_TMP/oom.alerts" 1800
+if [[ "$ALERT_LOG" == *"rclone"* ]]; then
+    test_result "OOM cooldown: alert fires again after cooldown expires" "pass"
+else
+    test_result "OOM cooldown: alert fires again after cooldown expires" "fail"
+fi
+
 # ── Notification Tests ────────────────────────────────────────────────
 
 echo ""
