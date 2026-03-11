@@ -468,6 +468,38 @@ else
     test_result "is_alert_active returns false for no alert" "fail"
 fi
 
+# --- Notification body includes compact timestamp ---
+reset_test_state
+NOTIFY_LOG=""
+# Override notify-send to capture the body
+notify-send() {
+    # Args: -u urgency -i icon summary body
+    shift 4  # skip -u critical -i icon
+    shift 1  # skip summary
+    NOTIFY_LOG="$1"
+}
+# Call the real send_alert from notify.sh (not our test wrapper)
+_ACTIVE_ALERTS=()
+source "$PROJECT_DIR/lib/notify.sh"
+send_alert "cpu" "test:ts" "Test message"
+# Restore test send_alert wrapper
+eval "$_orig_send_alert"
+send_alert() {
+    local type="$1" key="$2" message="$3"
+    if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+        return 1
+    fi
+    _ACTIVE_ALERTS[$key]=1
+    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}\n"
+    return 0
+}
+# Check that the notification body starts with a timestamp like [HH:MM]
+if [[ "$NOTIFY_LOG" =~ ^\[[0-2][0-9]:[0-5][0-9]\]\  ]]; then
+    test_result "Notification body includes compact [HH:MM] timestamp" "pass"
+else
+    test_result "Notification body includes compact [HH:MM] timestamp" "fail"
+fi
+
 # ── Integration Tests ─────────────────────────────────────────────────
 
 echo ""

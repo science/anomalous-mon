@@ -25,9 +25,11 @@ send_alert() {
     local urgency="critical"
     local icon="dialog-warning"
     local summary="anomalous-mon: ${type}"
+    local timestamp
+    timestamp="[$(date +%H:%M)]"
 
     if command -v notify-send &>/dev/null; then
-        notify-send -u "$urgency" -i "$icon" "$summary" "$message"
+        notify-send -u "$urgency" -i "$icon" "$summary" "${timestamp} ${message}"
     fi
 
     echo "[ALERT] ${type}: ${message}"
