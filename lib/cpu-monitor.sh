@@ -209,6 +209,7 @@ cpu_check_alerts() {
     _load_state "$state_file"
 
     # Check PID table
+    local -A _pid_alerted_names=()
     for pid in "${!_PID_COUNT[@]}"; do
         local name="${_PID_NAME[$pid]}"
         local cycles
@@ -218,19 +219,24 @@ cpu_check_alerts() {
             send_alert "cpu" "pid:${pid}" \
                 "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args}"
             _PID_ALERTED[$pid]=1
+            _pid_alerted_names[$name]=1
             alerted=1
         fi
     done
 
-    # Check Name table
+    # Check Name table (skip if a PID alert already fired for this name)
     for name in "${!_NAME_COUNT[@]}"; do
         local cycles
         cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
         if (( _NAME_COUNT[$name] >= cycles )) && [[ "${_NAME_ALERTED[$name]}" != "1" ]]; then
-            send_alert "cpu" "name:${name}" \
-                "Process '${name}' sustained high CPU for ${_NAME_COUNT[$name]} cycles"
-            _NAME_ALERTED[$name]=1
-            alerted=1
+            if [[ "${_pid_alerted_names[$name]:-}" == "1" ]]; then
+                _NAME_ALERTED[$name]=1
+            else
+                send_alert "cpu" "name:${name}" \
+                    "Process '${name}' sustained high CPU for ${_NAME_COUNT[$name]} cycles"
+                _NAME_ALERTED[$name]=1
+                alerted=1
+            fi
         fi
     done
 

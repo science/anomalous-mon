@@ -116,10 +116,10 @@ for i in {1..5}; do
     cpu_sample "$TEST_TMP/cpu.state" 60 25
 done
 cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
-if [[ "$ALERT_LOG" == *"pid:1234"* && "$ALERT_LOG" == *"name:rclone"* ]]; then
-    test_result "Process above threshold for 5 cycles → alert fires (both tables)" "pass"
+if [[ "$ALERT_LOG" == *"pid:1234"* && "$ALERT_LOG" != *"name:rclone"* ]]; then
+    test_result "Process above threshold for 5 cycles → PID alert fires, name alert suppressed" "pass"
 else
-    test_result "Process above threshold for 5 cycles → alert fires (both tables)" "fail"
+    test_result "Process above threshold for 5 cycles → PID alert fires, name alert suppressed" "fail"
 fi
 
 # --- Process drops below threshold → counter resets ---
