@@ -12,6 +12,8 @@ Built after an rclone mount grew to 1.9GB RSS and entered a GC loop at 193% CPU 
 
 **OOM kills and memory limit hits** — Checks journalctl for OOM-kill events and cgroup `memory.max` hits. Tracks journal cursor to avoid re-alerting on old events.
 
+**Collapsed notifications** — Successive alerts for the same process name (e.g. a pipeline spawning many short-lived `python` PIDs) replace the existing notification bubble instead of stacking. Each event still logs a distinct `[ALERT]` line to journald. The replace-id mapping is persisted in `${XDG_RUNTIME_DIR:-/tmp}/anomalous-mon.notify-ids` so replacement survives timer re-invocations.
+
 ## Install
 
 ```bash
@@ -48,7 +50,7 @@ OOM_LOOKBACK="2 minutes"   # journal window on cold start
 ./test/test-anomalous-mon.sh
 ```
 
-31 tests covering CPU dual-track logic, journal monitoring, notification deduplication, state file recovery, and integration scenarios.
+49 tests covering CPU dual-track logic, journal monitoring, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios.
 
 ## Design
 

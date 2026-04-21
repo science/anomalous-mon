@@ -26,6 +26,7 @@ STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 CPU_STATE_FILE="${STATE_DIR}/anomalous-mon.state"
 JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
 JOURNAL_ALERT_FILE="${STATE_DIR}/anomalous-mon.oom-alerts"
+NOTIFY_ID_FILE="${STATE_DIR}/anomalous-mon.notify-ids"
 
 # Handle --status
 if [[ "${1:-}" == "--status" ]]; then

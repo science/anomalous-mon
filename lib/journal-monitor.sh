@@ -137,7 +137,8 @@ journal_check() {
             local alert_key="oom:${proc_name}"
             if ! _journal_alert_suppressed "$alert_key" "$cooldown"; then
                 send_alert "oom" "$alert_key" \
-                    "OOM kill detected: ${proc_name} — ${message}"
+                    "OOM kill detected: ${proc_name} — ${message}" \
+                    "$alert_key"
                 _journal_alert_record "$alert_key"
             fi
         fi
@@ -149,7 +150,8 @@ journal_check() {
             local alert_key="memmax:${unit}"
             if ! _journal_alert_suppressed "$alert_key" "$cooldown"; then
                 send_alert "oom" "$alert_key" \
-                    "Memory limit hit: ${unit} — ${message}"
+                    "Memory limit hit: ${unit} — ${message}" \
+                    "$alert_key"
                 _journal_alert_record "$alert_key"
             fi
         fi

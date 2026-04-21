@@ -217,7 +217,8 @@ cpu_check_alerts() {
         if (( _PID_COUNT[$pid] >= cycles )) && [[ "${_PID_ALERTED[$pid]}" != "1" ]]; then
             local args="${_PID_ARGS[$pid]:-$name}"
             send_alert "cpu" "pid:${pid}" \
-                "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args}"
+                "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args}" \
+                "$name"
             _PID_ALERTED[$pid]=1
             _pid_alerted_names[$name]=1
             alerted=1
@@ -233,7 +234,8 @@ cpu_check_alerts() {
                 _NAME_ALERTED[$name]=1
             else
                 send_alert "cpu" "name:${name}" \
-                    "Process '${name}' sustained high CPU for ${_NAME_COUNT[$name]} cycles"
+                    "Process '${name}' sustained high CPU for ${_NAME_COUNT[$name]} cycles" \
+                    "$name"
                 _NAME_ALERTED[$name]=1
                 alerted=1
             fi

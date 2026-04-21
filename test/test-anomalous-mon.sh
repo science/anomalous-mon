@@ -47,18 +47,19 @@ _real_notify_send="$(command -v notify-send 2>/dev/null || true)"
 # Override notify-send so it's never called for real
 notify-send() { :; }
 
-# Wrap send_alert to log calls
+# Wrap send_alert to log calls.
+# ALERT_LOG format per entry: type|key|message|group\n
 _orig_send_alert="$(declare -f send_alert)"
 send_alert() {
-    local type="$1" key="$2" message="$3"
+    local type="$1" key="$2" message="$3" group="${4:-}"
 
-    # Check dedup
+    # In-memory key dedup (applies regardless of group)
     if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
         return 1
     fi
     _ACTIVE_ALERTS[$key]=1
 
-    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}\n"
+    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|${group}\n"
     return 0
 }
 
@@ -120,6 +121,19 @@ if [[ "$ALERT_LOG" == *"pid:1234"* && "$ALERT_LOG" != *"name:rclone"* ]]; then
     test_result "Process above threshold for 5 cycles → PID alert fires, name alert suppressed" "pass"
 else
     test_result "Process above threshold for 5 cycles → PID alert fires, name alert suppressed" "fail"
+fi
+
+# --- PID alert passes process name as dedup group ---
+reset_test_state
+set_mock_ps "1234 70.0 rclone"
+for i in {1..5}; do
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if echo -e "$ALERT_LOG" | grep -qE '^cpu\|pid:1234\|.*\|rclone$'; then
+    test_result "PID alert passes process name as dedup group" "pass"
+else
+    test_result "PID alert passes process name as dedup group" "fail"
 fi
 
 # --- Process drops below threshold → counter resets ---
@@ -190,6 +204,19 @@ if [[ "$ALERT_LOG" == *"name:crasher"* ]]; then
     test_result "Same process name, rotating PIDs → name table alerts" "pass"
 else
     test_result "Same process name, rotating PIDs → name table alerts" "fail"
+fi
+
+# --- Name alert passes process name as dedup group ---
+reset_test_state
+for i in {1..5}; do
+    set_mock_ps "$((1000 + i)) 70.0 crasher"
+    cpu_sample "$TEST_TMP/cpu.state" 60 25
+done
+cpu_check_alerts "$TEST_TMP/cpu.state" 5 || true
+if echo -e "$ALERT_LOG" | grep -qE '^cpu\|name:crasher\|.*\|crasher$'; then
+    test_result "Name alert passes process name as dedup group" "pass"
+else
+    test_result "Name alert passes process name as dedup group" "fail"
 fi
 
 # --- Same PID, name changes → PID table still accumulates ---
@@ -334,6 +361,16 @@ if [[ "$ALERT_LOG" == *"oom"* && "$ALERT_LOG" == *"rclone"* ]]; then
     test_result "OOM kill detected → alert with process name" "pass"
 else
     test_result "OOM kill detected → alert with process name" "fail"
+fi
+
+# --- OOM alert passes alert key as dedup group ---
+reset_test_state
+_JOURNAL_CMD="_mock_journal_oom"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if echo -e "$ALERT_LOG" | grep -qE '^oom\|oom:rclone\|.*\|oom:rclone$'; then
+    test_result "OOM alert passes alert key as dedup group" "pass"
+else
+    test_result "OOM alert passes alert key as dedup group" "fail"
 fi
 
 # --- memory.max hit detected → alert with service name ---
@@ -485,12 +522,12 @@ send_alert "cpu" "test:ts" "Test message"
 # Restore test send_alert wrapper
 eval "$_orig_send_alert"
 send_alert() {
-    local type="$1" key="$2" message="$3"
+    local type="$1" key="$2" message="$3" group="${4:-}"
     if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
         return 1
     fi
     _ACTIVE_ALERTS[$key]=1
-    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}\n"
+    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|${group}\n"
     return 0
 }
 # Check that the notification body starts with a timestamp like [HH:MM]
@@ -499,6 +536,159 @@ if [[ "$NOTIFY_LOG" =~ ^\[[0-2][0-9]:[0-5][0-9]\]\  ]]; then
 else
     test_result "Notification body includes compact [HH:MM] timestamp" "fail"
 fi
+
+# ── Grouped Notification Tests ────────────────────────────────────────
+#
+# These tests exercise the real send_alert from lib/notify.sh (not the test
+# mock wrapper). They mock notify-send itself to capture the argv of each
+# invocation and return fake incrementing ids when -p is present.
+
+echo ""
+echo "=== Grouped Notification Tests ==="
+echo ""
+
+setup_real_notify_test() {
+    # send_alert's grouped path invokes notify-send in $(...) command
+    # substitution, so shell-variable updates in the mock don't propagate
+    # back to the parent. Capture calls in files instead.
+    NOTIFY_CALLS_FILE="$TEST_TMP/notify-calls.log"
+    NOTIFY_ID_COUNTER_FILE="$TEST_TMP/notify-id-counter"
+    rm -f "$NOTIFY_CALLS_FILE" "$NOTIFY_ID_COUNTER_FILE"
+    NOTIFY_ID_FILE="$TEST_TMP/notify-ids"
+    rm -f "$NOTIFY_ID_FILE"
+    # Re-source real notify.sh (clobbers test wrapper)
+    source "$PROJECT_DIR/lib/notify.sh"
+    _ACTIVE_ALERTS=()
+    # Capture notify-send argv; emit incrementing id when -p is present
+    notify-send() {
+        local has_p=0 joined=""
+        local a
+        for a in "$@"; do
+            joined="${joined}${joined:+||}${a}"
+            [[ "$a" == "-p" ]] && has_p=1
+        done
+        echo "$joined" >> "$NOTIFY_CALLS_FILE"
+        if (( has_p )); then
+            local next=1000
+            if [[ -f "$NOTIFY_ID_COUNTER_FILE" ]]; then
+                next=$(( $(cat "$NOTIFY_ID_COUNTER_FILE") + 1 ))
+            fi
+            echo "$next" > "$NOTIFY_ID_COUNTER_FILE"
+            echo "$next"
+        fi
+    }
+}
+
+# Read the Nth captured notify-send invocation (1-indexed).
+_notify_call() {
+    sed -n "${1}p" "$NOTIFY_CALLS_FILE" 2>/dev/null || true
+}
+
+# Latest notify id emitted (or empty if no -p calls yet).
+_notify_last_id() {
+    cat "$NOTIFY_ID_COUNTER_FILE" 2>/dev/null || true
+}
+
+teardown_real_notify_test() {
+    unset -f notify-send 2>/dev/null || true
+    unset NOTIFY_ID_FILE
+    # Restore test send_alert wrapper
+    eval "$_orig_send_alert"
+    send_alert() {
+        local type="$1" key="$2" message="$3" group="${4:-}"
+        if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+            return 1
+        fi
+        _ACTIVE_ALERTS[$key]=1
+        ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|${group}\n"
+        return 0
+    }
+}
+
+# --- Ungrouped alert: notify-send called without -p or -r ---
+setup_real_notify_test
+send_alert "cpu" "pid:999" "Test message" >/dev/null
+call1="$(_notify_call 1)"
+if [[ "$call1" != *"||-p"* ]] && [[ "$call1" != *"||-r||"* ]]; then
+    test_result "Ungrouped alert: notify-send invoked without -p or -r" "pass"
+else
+    test_result "Ungrouped alert: notify-send invoked without -p or -r" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alert first call: -p present, -r absent ---
+setup_real_notify_test
+send_alert "cpu" "pid:111" "Python 1 hot" "python" >/dev/null
+call1="$(_notify_call 1)"
+if [[ "$call1" == *"||-p||"* ]] && [[ "$call1" != *"||-r||"* ]]; then
+    test_result "Grouped first call: -p present, -r absent" "pass"
+else
+    test_result "Grouped first call: -p present, -r absent" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alert second call: -r carries stored id ---
+setup_real_notify_test
+send_alert "cpu" "pid:111" "Python 1 hot" "python" >/dev/null
+first_id="$(_notify_last_id)"
+send_alert "cpu" "pid:112" "Python 2 hot" "python" >/dev/null
+call2="$(_notify_call 2)"
+if [[ "$call2" == *"||-r||${first_id}||"* ]]; then
+    test_result "Grouped second call: -r carries stored id" "pass"
+else
+    test_result "Grouped second call: -r carries stored id" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alerts for different groups: independent replace-ids ---
+setup_real_notify_test
+send_alert "cpu" "pid:111" "Python 1" "python" >/dev/null
+python_id="$(_notify_last_id)"
+send_alert "cpu" "pid:222" "Firefox 1" "firefox" >/dev/null
+firefox_id="$(_notify_last_id)"
+send_alert "cpu" "pid:112" "Python 2" "python" >/dev/null
+call3="$(_notify_call 3)"
+if [[ "$call3" == *"||-r||${python_id}||"* ]] && [[ "${python_id}" != "${firefox_id}" ]]; then
+    test_result "Grouped: independent replace-ids per group" "pass"
+else
+    test_result "Grouped: independent replace-ids per group" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alert persists id to NOTIFY_ID_FILE ---
+setup_real_notify_test
+send_alert "cpu" "pid:111" "Python 1" "python" >/dev/null
+stored_id="$(_notify_last_id)"
+if [[ -f "$NOTIFY_ID_FILE" ]] && grep -qE "^python	${stored_id}$" "$NOTIFY_ID_FILE"; then
+    test_result "Grouped alert persists id to NOTIFY_ID_FILE" "pass"
+else
+    test_result "Grouped alert persists id to NOTIFY_ID_FILE" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alert loads existing id from NOTIFY_ID_FILE ---
+setup_real_notify_test
+# Prepopulate the file as if a prior anomalous-mon run left it there
+printf 'python\t7777\n' > "$NOTIFY_ID_FILE"
+send_alert "cpu" "pid:999" "Python after restart" "python" >/dev/null
+call1="$(_notify_call 1)"
+if [[ "$call1" == *"||-r||7777||"* ]]; then
+    test_result "Grouped alert loads existing id from NOTIFY_ID_FILE" "pass"
+else
+    test_result "Grouped alert loads existing id from NOTIFY_ID_FILE" "fail"
+fi
+teardown_real_notify_test
+
+# --- Grouped alert always emits [ALERT] log line (not suppressed by in-memory dedup) ---
+setup_real_notify_test
+log1="$(send_alert "cpu" "pid:111" "Python 1" "python")"
+log2="$(send_alert "cpu" "pid:112" "Python 2" "python")"
+if [[ "$log1" == *"[ALERT]"*"Python 1"* ]] && [[ "$log2" == *"[ALERT]"*"Python 2"* ]]; then
+    test_result "Grouped alerts always emit [ALERT] log line" "pass"
+else
+    test_result "Grouped alerts always emit [ALERT] log line" "fail"
+fi
+teardown_real_notify_test
 
 # ── Integration Tests ─────────────────────────────────────────────────
 
