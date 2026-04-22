@@ -41,10 +41,17 @@ journalctl --user -u anomalous-mon -f
 Edit `etc/anomalous-mon.conf`:
 
 ```bash
-CPU_THRESHOLD=25           # percent (of one core)
+CPU_THRESHOLD=60           # percent of one core (per-process)
+CPU_THRESHOLD_TOTAL=25     # percent of total CPU (all cores combined)
 CPU_SUSTAINED_CYCLES=5     # consecutive samples before alert (5 min at 60s interval)
 OOM_LOOKBACK="2 minutes"   # journal window on cold start
+
+DISK_WARN_PCT=80           # percent-used threshold for WARN
+DISK_CRIT_PCT=92           # percent-used threshold for CRITICAL
+DISK_MIN_FREE_GB=10        # WARN is AND-gated by this absolute headroom
 ```
+
+Per-mount disk threshold overrides (e.g. `/boot` runs 70–80% full by design) are set via the `DISK_THRESHOLD_OVERRIDES` associative array in the same config file.
 
 ## Tests
 

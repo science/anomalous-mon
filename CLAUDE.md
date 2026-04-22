@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, ~49 tests, no side effects (all I/O redirected to `$(mktemp -d)`).
+- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O redirected to `$(mktemp -d)`).
 - **Run a single test:** there's no test selector. The suite is a single bash file with inline assertions; comment out sections you don't want to run, or copy the `reset_test_state` + assertion block into a scratch script that sources the libs.
 - **Run one monitoring cycle manually:** `bin/anomalous-mon` (with no args). This is what the systemd timer invokes — safe to run ad-hoc.
 - **Inspect current tracking state:** `bin/anomalous-mon --status`.
@@ -55,12 +55,28 @@ Self-feed filter: journal entries whose `_SYSTEMD_USER_UNIT == "anomalous-mon.se
 
 Kernel `Out of memory: Killed process N (name) …` lines contain the victim's real process name; the scope-level `Failed with result 'oom-kill'` lines do not. The OOM detector currently parses both but the victim-name extraction only works on the kernel line.
 
+### Disk-space monitoring (`lib/disk-monitor.sh`)
+
+Two severities per mount, computed fresh each tick from `df --output=target,fstype,pcent,avail` (not `-P`; the two options are mutually exclusive on GNU coreutils):
+
+- **CRITICAL** fires when `pcent >= CRIT_PCT`, unconditionally. Short cooldown (`DISK_CRIT_COOLDOWN`, 300s default) so it keeps nagging until cleared.
+- **WARN** fires when `pcent >= WARN_PCT` **AND** `avail < MIN_FREE_GB`. The AND-gate is load-bearing: it silences a 2 TB disk at 80% (400 GB free) while still catching a 40 GB VM at 80% (8 GB free). Long cooldown (`DISK_WARN_COOLDOWN`, 1800s default).
+
+`disk_check` runs two passes over the sample. The CRITICAL pass records any mount that fired into `_crit_fired_mounts`; the WARN pass then skips those mounts so a single tick never emits both alerts for the same mount. The `notify-send` group is `disk:<mount>` (severity is *not* part of the group) so as a mount climbs WARN → CRITICAL the bubble replaces in place rather than stacking.
+
+**Per-mount overrides** via `DISK_THRESHOLD_OVERRIDES` in the config, formatted `"warn:crit:min_free_gb"` with `-` to inherit. `/boot` and `/boot/efi` ship with tightened overrides because they legitimately run 70-80% full.
+
+**Fstype filtering** is belt-and-suspenders: the sampler passes `-x` flags to df (tmpfs, squashfs, efivarfs, overlay, fuse.*, autofs, nfs, cifs, virtiofs, …), and `disk_check` re-checks the fstype column against `_DISK_EXCLUDE_FSTYPES` in case a mock or future sample source leaks a pseudo fs through.
+
+**Float comparisons.** Bash `(( ))` can't compare floats, and `MIN_FREE_GB` can be fractional (e.g. `0.1` for `/boot`). `_disk_lt` and `_disk_kb_to_gb` shell out to `awk` for the float work; the integer comparisons (pcent vs. warn/crit) stay in native bash.
+
 ### Test mocking model (`test/test-anomalous-mon.sh`)
 
 The libs are designed to be sourced and mocked:
 
 - `_CPU_SAMPLE_CMD` — override `_cpu_sample_cmd` with a function returning fake `pid %cpu comm args` lines. `set_mock_ps "..."` is a convenience helper.
 - `_JOURNAL_CMD` — override `_journal_cmd` with a function returning fake journalctl JSON.
+- `_DISK_SAMPLE_CMD` — override `_disk_sample_cmd` with a function returning fake `target fstype pcent avail_kb` lines (one per mount). `set_mock_disk "..."` is the convenience helper.
 - `_NPROC` — override `nproc` for deterministic total-CPU threshold math (fixed to 4 in tests).
 
 There are two flavors of `send_alert` in the test file:
@@ -76,6 +92,7 @@ All under `${XDG_RUNTIME_DIR:-/tmp}`:
 | `anomalous-mon.state` | CPU dual-track counters + alerted flags | line-based: `pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>` or `name:<NAME>:<COUNT>:<ALERTED>` |
 | `anomalous-mon.cursor` | last journalctl cursor | single line, opaque cursor token |
 | `anomalous-mon.oom-alerts` | OOM cooldown state | `<key>:<epoch>` per line |
+| `anomalous-mon.disk-alerts` | Disk WARN/CRITICAL cooldown state | `disk:<mount>:<severity>:<epoch>` per line; `<severity>` is `warn` or `critical`. Parsed with `${line%:*}` / `${line##*:}` so a key with embedded colons like `disk:/:warn` still splits correctly. |
 | `anomalous-mon.notify-ids` | group → notify-send id | `<group>\t<id>` per line |
 
 Corrupt state files are tolerated: the loaders parse defensively and fall through to empty state on garbage (tested).
