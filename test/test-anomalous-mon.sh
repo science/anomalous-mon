@@ -333,6 +333,161 @@ else
     test_result "Total-CPU threshold: process below both thresholds (80% < 100%, 80% < 200%) → no alert" "fail"
 fi
 
+# ── Disk Monitor Tests ────────────────────────────────────────────────
+
+echo ""
+echo "=== Disk Monitor Tests ==="
+echo ""
+
+source "$PROJECT_DIR/lib/disk-monitor.sh"
+
+# Mock df output. Format per line: target fstype pcent avail_kb
+set_mock_disk() {
+    _DISK_SAMPLE_CMD="_mock_disk_output"
+    _MOCK_DISK_DATA="$*"
+}
+
+_mock_disk_output() {
+    echo "$_MOCK_DISK_DATA"
+}
+
+# --- Below warn → no alert ---
+reset_test_state
+set_mock_disk "/ ext4 50 50000000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk below warn threshold → no alert" "pass"
+else
+    test_result "Disk below warn threshold → no alert" "fail"
+fi
+
+# --- Crosses warn + below min-free → WARN fires ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/ ext4 85 8000000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ "$ALERT_LOG" == *"disk:/:warn"* && "$ALERT_LOG" == *"WARN"* ]]; then
+    test_result "Disk crosses warn + below min-free → WARN fires" "pass"
+else
+    test_result "Disk crosses warn + below min-free → WARN fires" "fail"
+fi
+
+# --- Crosses warn + plenty free → WARN suppressed (AND gate) ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/ ext4 85 524288000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk crosses warn but plenty free → WARN suppressed (AND gate)" "pass"
+else
+    test_result "Disk crosses warn but plenty free → WARN suppressed (AND gate)" "fail"
+fi
+
+# --- Crosses critical → CRITICAL fires; WARN suppressed same tick ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/ ext4 95 2000000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ "$ALERT_LOG" == *"disk:/:critical"* && "$ALERT_LOG" == *"CRITICAL"* && "$ALERT_LOG" != *"disk:/:warn"* ]]; then
+    test_result "Disk crosses critical → CRITICAL fires, WARN suppressed in same tick" "pass"
+else
+    test_result "Disk crosses critical → CRITICAL fires, WARN suppressed in same tick" "fail"
+fi
+
+# --- Per-mount override: /boot at 80% with 90/97 → no alert ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+declare -gA DISK_THRESHOLD_OVERRIDES=([/boot]="90:97:0.1")
+set_mock_disk "/boot ext4 80 200000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk override: /boot at 80% with 90/97 threshold → no alert" "pass"
+else
+    test_result "Disk override: /boot at 80% with 90/97 threshold → no alert" "fail"
+fi
+
+# --- Per-mount override: /boot at 92% → WARN fires with overridden thresholds ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+declare -gA DISK_THRESHOLD_OVERRIDES=([/boot]="90:97:0.1")
+set_mock_disk "/boot ext4 92 50000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ "$ALERT_LOG" == *"disk:/boot:warn"* ]]; then
+    test_result "Disk override: /boot at 92% with overridden thresholds → WARN fires" "pass"
+else
+    test_result "Disk override: /boot at 92% with overridden thresholds → WARN fires" "fail"
+fi
+unset DISK_THRESHOLD_OVERRIDES
+
+# --- Cooldown dedup: back-to-back CRITICAL → one alert ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/ ext4 95 2000000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+first_disk="$ALERT_LOG"
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -n "$first_disk" && -z "$ALERT_LOG" ]]; then
+    test_result "Disk cooldown: duplicate within cooldown is suppressed" "pass"
+else
+    test_result "Disk cooldown: duplicate within cooldown is suppressed" "fail"
+fi
+
+# --- Cooldown: alert fires again after cooldown expires ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/ ext4 95 2000000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+# Backdate the alert state to simulate cooldown expiry
+sed -i 's/:[0-9]*$/:1000000000/' "$TEST_TMP/disk.alerts"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ "$ALERT_LOG" == *"disk:/:critical"* ]]; then
+    test_result "Disk cooldown: alert fires again after cooldown expires" "pass"
+else
+    test_result "Disk cooldown: alert fires again after cooldown expires" "fail"
+fi
+
+# --- Fstype filter: excluded fstypes never alert ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/snap/core squashfs 99 100
+/run tmpfs 99 1000
+/dev devtmpfs 99 1000"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk fstype filter: excluded fstypes ignored even at 99%" "pass"
+else
+    test_result "Disk fstype filter: excluded fstypes ignored even at 99%" "fail"
+fi
+
+# --- Empty df output → no crash, no alert ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk ""
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk empty df output → no crash, no alert" "pass"
+else
+    test_result "Disk empty df output → no crash, no alert" "fail"
+fi
+
+# --- Garbage df line (missing columns) → skipped, no crash ---
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "garbage_line_missing_columns"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300 2>/dev/null || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Disk garbage df line → skipped, no crash" "pass"
+else
+    test_result "Disk garbage df line → skipped, no crash" "fail"
+fi
+
+# Reset _DISK_SAMPLE_CMD so later tests don't pick it up
+unset _DISK_SAMPLE_CMD
+
 # ── Journal Monitor Tests ─────────────────────────────────────────────
 
 echo ""
@@ -738,7 +893,7 @@ for f in bin lib etc test; do
     fi
 done
 
-for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
+for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
     if [[ -f "$PROJECT_DIR/$f" ]]; then
         test_result "File $f exists" "pass"
     else

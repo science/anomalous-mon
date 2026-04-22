@@ -137,7 +137,13 @@ Tests use a pass/fail pattern similar to the yadm dotfiles test suite. Key test 
 - No web UI, no metrics storage, no historical graphs
 - No email/SMS alerting (desktop notifications only)
 - No automatic remediation (alert only, never kill/restart)
-- No monitoring of disk, network, or other resources (CPU and memory/OOM only, for now)
+- No monitoring of network or other resources beyond CPU, memory/OOM, and disk
+
+## Implemented modules
+
+- CPU monitoring (`lib/cpu-monitor.sh`) — dual-track PID/name tables, per-process sustained-cycle overrides.
+- Journal / OOM monitoring (`lib/journal-monitor.sh`) — cursor-based OOM and `memory.max` detection with cooldown dedup.
+- Disk-space monitoring (`lib/disk-monitor.sh`) — per-mount WARN (percent AND absolute-free gate) and CRITICAL alerts with per-mount threshold overrides. Added after dev-1 wedged at 100% disk; the AND-gate avoids noise on large drives while still catching small VMs.
 
 ## Machine context
 

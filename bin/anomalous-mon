@@ -20,12 +20,14 @@ source "$PROJECT_DIR/etc/anomalous-mon.conf"
 source "$PROJECT_DIR/lib/notify.sh"
 source "$PROJECT_DIR/lib/cpu-monitor.sh"
 source "$PROJECT_DIR/lib/journal-monitor.sh"
+source "$PROJECT_DIR/lib/disk-monitor.sh"
 
 # Runtime state files
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 CPU_STATE_FILE="${STATE_DIR}/anomalous-mon.state"
 JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
 JOURNAL_ALERT_FILE="${STATE_DIR}/anomalous-mon.oom-alerts"
+DISK_ALERT_FILE="${STATE_DIR}/anomalous-mon.disk-alerts"
 NOTIFY_ID_FILE="${STATE_DIR}/anomalous-mon.notify-ids"
 
 # Handle --status
@@ -37,6 +39,8 @@ if [[ "${1:-}" == "--status" ]]; then
     else
         echo "Journal cursor: none (will scan recent window on next run)"
     fi
+    echo ""
+    disk_status "$DISK_ALERT_FILE" "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB"
     exit 0
 fi
 
@@ -44,6 +48,9 @@ fi
 cpu_sample "$CPU_STATE_FILE" "$CPU_THRESHOLD" "$CPU_THRESHOLD_TOTAL"
 cpu_check_alerts "$CPU_STATE_FILE" "$CPU_SUSTAINED_CYCLES"
 journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK" "$JOURNAL_ALERT_FILE" "$OOM_COOLDOWN"
+disk_check "$DISK_ALERT_FILE" \
+    "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB" \
+    "$DISK_WARN_COOLDOWN" "$DISK_CRIT_COOLDOWN"
 
 # Log tracking state if anything is being tracked
 _load_state "$CPU_STATE_FILE"

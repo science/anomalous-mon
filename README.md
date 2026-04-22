@@ -12,6 +12,8 @@ Built after an rclone mount grew to 1.9GB RSS and entered a GC loop at 193% CPU 
 
 **OOM kills and memory limit hits** — Checks journalctl for OOM-kill events and cgroup `memory.max` hits. Tracks journal cursor to avoid re-alerting on old events.
 
+**Disk-space exhaustion** — Two severities per mount. WARN fires when a filesystem crosses `DISK_WARN_PCT` *and* absolute free space drops below `DISK_MIN_FREE_GB` (the AND-gate silences large disks with generous headroom but still catches small VM disks). CRITICAL fires unconditionally on percent once `DISK_CRIT_PCT` is crossed. Pseudo/virtual/network filesystems (tmpfs, squashfs, overlay, nfs, etc.) are excluded. Per-mount thresholds are overridable via `DISK_THRESHOLD_OVERRIDES` in the config — e.g. `/boot` legitimately runs 70–80% full.
+
 **Collapsed notifications** — Successive alerts for the same process name (e.g. a pipeline spawning many short-lived `python` PIDs) replace the existing notification bubble instead of stacking. Each event still logs a distinct `[ALERT]` line to journald. The replace-id mapping is persisted in `${XDG_RUNTIME_DIR:-/tmp}/anomalous-mon.notify-ids` so replacement survives timer re-invocations.
 
 ## Install
@@ -50,7 +52,7 @@ OOM_LOOKBACK="2 minutes"   # journal window on cold start
 ./test/test-anomalous-mon.sh
 ```
 
-49 tests covering CPU dual-track logic, journal monitoring, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios.
+Covers CPU dual-track logic, journal monitoring, disk WARN/CRITICAL severity gating, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios.
 
 ## Design
 
