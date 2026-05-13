@@ -216,8 +216,12 @@ cpu_check_alerts() {
         cycles="$(_get_sustained_cycles "$name" "$default_cycles")"
         if (( _PID_COUNT[$pid] >= cycles )) && [[ "${_PID_ALERTED[$pid]}" != "1" ]]; then
             local args="${_PID_ARGS[$pid]:-$name}"
+            # Truncate args so a giant qemu/libvirt cmdline doesn't overflow the desktop bubble.
+            # Full args are still logged each cycle by the [tracking] line in bin/anomalous-mon.
+            local args_short="${args:0:200}"
+            (( ${#args} > 200 )) && args_short="${args_short}…"
             send_alert "cpu" "pid:${pid}" \
-                "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args}" \
+                "PID ${pid} (${name}) sustained high CPU for ${_PID_COUNT[$pid]} cycles: ${args_short}" \
                 "$name"
             _PID_ALERTED[$pid]=1
             _pid_alerted_names[$name]=1
