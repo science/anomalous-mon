@@ -145,3 +145,9 @@ Corrupt state files are tolerated: the loaders parse defensively and fall throug
 - Libs declare `_FOO` private helpers (underscore prefix) and expose only a small public surface (`cpu_sample`, `cpu_check_alerts`, `cpu_status`, `journal_check`, `send_alert`, `clear_alert`, `is_alert_active`).
 - State I/O uses a write-tmp-then-`mv` pattern for atomicity — follow it when adding new state files.
 - Configuration lives in `etc/anomalous-mon.conf`, sourced by `bin/anomalous-mon` at startup. Don't hardcode thresholds in libs.
+
+## Design docs at repo root
+
+- `PLAN.md` — original project plan.
+- `PLAN-<feature>.md` — per-feature design plans, written before implementation (e.g. `PLAN-disk-monitor.md`, `PLAN-service-monitor.md`). Read the matching plan before working on a feature — it captures the rationale that the code itself doesn't.
+- `FINDINGS-<topic>-<date>.md` — diagnostic write-ups of incidents that motivated (or could have been caught by) a monitor. Useful context when designing new checks; often paired with a `PLAN-*.md` for the resulting feature.
