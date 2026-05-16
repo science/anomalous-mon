@@ -63,6 +63,21 @@ send_alert() {
     return 0
 }
 
+# Wrap send_alert_action similarly so stale-files tests don't spawn real
+# systemd-run units. Logs to ALERT_LOG as: type|key|message|action:<label>:<cmd>
+_orig_send_alert_action="$(declare -f send_alert_action 2>/dev/null || true)"
+send_alert_action() {
+    local type="$1" key="$2" message="$3" label="$4" action_cmd="$5"
+
+    if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+        return 1
+    fi
+    _ACTIVE_ALERTS[$key]=1
+
+    ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|action:${label}:${action_cmd}\n"
+    return 0
+}
+
 # Reset test state
 reset_test_state() {
     ALERT_LOG=""
@@ -845,6 +860,448 @@ else
 fi
 teardown_real_notify_test
 
+# ── send_alert_action Tests ───────────────────────────────────────────
+#
+# send_alert_action spawns a transient systemd-run scope that wraps
+# notify-send --wait, so user clicks survive the parent script exit.
+# We mock both systemd-run and notify-send to capture their invocations.
+
+echo ""
+echo "=== send_alert_action Tests ==="
+echo ""
+
+setup_action_test() {
+    SYSTEMD_RUN_CALLS_FILE="$TEST_TMP/systemd-run-calls.log"
+    NOTIFY_CALLS_FILE="$TEST_TMP/notify-calls.log"
+    rm -f "$SYSTEMD_RUN_CALLS_FILE" "$NOTIFY_CALLS_FILE"
+    NOTIFY_ID_FILE="$TEST_TMP/notify-ids"
+    rm -f "$NOTIFY_ID_FILE"
+    source "$PROJECT_DIR/lib/notify.sh"
+    _ACTIVE_ALERTS=()
+
+    # Mock systemd-run: capture argv (one call per file line; args joined by ||).
+    # Embedded newlines in args (e.g. the bash -c script) are escaped to '\n'
+    # so each invocation occupies exactly one line.
+    systemd-run() {
+        local joined=""
+        local a
+        for a in "$@"; do
+            a="${a//$'\n'/\\n}"
+            joined="${joined}${joined:+||}${a}"
+        done
+        printf '%s\n' "$joined" >> "$SYSTEMD_RUN_CALLS_FILE"
+    }
+
+    # Mock notify-send the same way the grouped tests do.
+    notify-send() {
+        local joined=""
+        local a
+        for a in "$@"; do
+            a="${a//$'\n'/\\n}"
+            joined="${joined}${joined:+||}${a}"
+        done
+        printf '%s\n' "$joined" >> "$NOTIFY_CALLS_FILE"
+    }
+
+    # Mock command lookup so the lib detects systemd-run as available.
+    command() {
+        if [[ "$1" == "-v" && "$2" == "systemd-run" ]]; then
+            echo "/usr/bin/systemd-run"
+            return 0
+        fi
+        builtin command "$@"
+    }
+}
+
+teardown_action_test() {
+    unset -f systemd-run notify-send command 2>/dev/null || true
+    unset SYSTEMD_RUN_CALLS_FILE
+    eval "$_orig_send_alert"
+    send_alert() {
+        local type="$1" key="$2" message="$3" group="${4:-}"
+        if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+            return 1
+        fi
+        _ACTIVE_ALERTS[$key]=1
+        ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|${group}\n"
+        return 0
+    }
+    # Restore the test wrapper for send_alert_action too
+    send_alert_action() {
+        local type="$1" key="$2" message="$3" label="$4" action_cmd="$5"
+        if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+            return 1
+        fi
+        _ACTIVE_ALERTS[$key]=1
+        ALERT_LOG="${ALERT_LOG}${type}|${key}|${message}|action:${label}:${action_cmd}\n"
+        return 0
+    }
+}
+
+# --- send_alert_action emits [ALERT] log line ---
+setup_action_test
+log="$(send_alert_action "stale-files" "stale:1" "Test message" "Open" "xdg-open /tmp/x")"
+if [[ "$log" == *"[ALERT] stale-files: Test message"* ]]; then
+    test_result "send_alert_action: emits [ALERT] log line" "pass"
+else
+    test_result "send_alert_action: emits [ALERT] log line" "fail"
+fi
+teardown_action_test
+
+# --- send_alert_action invokes systemd-run when available ---
+setup_action_test
+send_alert_action "stale-files" "stale:2" "Test message" "Open report" "xdg-open /tmp/x" >/dev/null
+call="$(cat "$SYSTEMD_RUN_CALLS_FILE" 2>/dev/null || true)"
+if [[ "$call" == *"systemd-run"* || "$call" == *"--user"* ]] \
+    && [[ "$call" == *"Open report"* ]] \
+    && [[ "$call" == *"xdg-open /tmp/x"* ]] \
+    && [[ "$call" == *"Test message"* ]]; then
+    test_result "send_alert_action: invokes systemd-run with label, message, ACTION_CMD" "pass"
+else
+    test_result "send_alert_action: invokes systemd-run with label, message, ACTION_CMD" "fail"
+fi
+teardown_action_test
+
+# --- send_alert_action in-memory dedup: same key not spawned twice ---
+setup_action_test
+send_alert_action "stale-files" "stale:dup" "First" "Open" "true" >/dev/null || true
+send_alert_action "stale-files" "stale:dup" "Second" "Open" "true" >/dev/null || true
+calls=$(wc -l < "$SYSTEMD_RUN_CALLS_FILE" 2>/dev/null || echo 0)
+if (( calls == 1 )); then
+    test_result "send_alert_action: in-memory dedup suppresses duplicate KEY" "pass"
+else
+    test_result "send_alert_action: in-memory dedup suppresses duplicate KEY" "fail"
+fi
+teardown_action_test
+
+# --- send_alert_action fallback when systemd-run missing ---
+setup_action_test
+# Override command -v to deny systemd-run
+command() {
+    if [[ "$1" == "-v" && "$2" == "systemd-run" ]]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+send_alert_action "stale-files" "stale:nofallback" "Test fallback" "Open" "xdg-open /tmp/x" >/dev/null
+# systemd-run should NOT have been called
+sr_calls=$(wc -l < "$SYSTEMD_RUN_CALLS_FILE" 2>/dev/null || echo 0)
+# notify-send SHOULD have been called (the fallback path)
+ns_calls=$(wc -l < "$NOTIFY_CALLS_FILE" 2>/dev/null || echo 0)
+if (( sr_calls == 0 )) && (( ns_calls == 1 )); then
+    test_result "send_alert_action: falls back to plain notify-send when systemd-run absent" "pass"
+else
+    test_result "send_alert_action: falls back to plain notify-send when systemd-run absent" "fail"
+fi
+teardown_action_test
+
+# ── Stale Files Monitor Tests ─────────────────────────────────────────
+
+echo ""
+echo "=== Stale Files Monitor Tests ==="
+echo ""
+
+source "$PROJECT_DIR/lib/stale-files-monitor.sh"
+
+# Mock find output. Format per line: size_bytes<TAB>mtime_epoch<TAB>path
+# Usage: set_mock_stale "2147483648	1700000000	/path/a" "1073741824	1690000000	/path/b"
+set_mock_stale() {
+    _STALE_FILES_SCAN_CMD="_mock_stale_output"
+    _MOCK_STALE_DATA="$(printf '%s\n' "$@")"
+}
+
+_mock_stale_output() {
+    [[ -n "${_MOCK_STALE_DATA:-}" ]] && printf '%s\n' "$_MOCK_STALE_DATA"
+}
+
+reset_stale_state() {
+    reset_test_state
+    unset _STALE_FILES_SCAN_CMD _MOCK_STALE_DATA _STALE_FINDMNT_CMD _MOCK_FINDMNT_DATA
+    unset STALE_FILES_IGNORE STALE_FILES_ROOTS
+    STALE_FILES_IGNORE=()
+    STALE_FILES_ROOTS=("$TEST_TMP")
+    STALE_FILES_MIN_SIZE_GB=1
+    STALE_FILES_AGE_DAYS=180
+    STALE_FILES_ACK_TTL=90
+    STALE_FILES_MAX_REPORT_ENTRIES=50
+    STALE_FILES_FSTYPE_EXCLUDE='fuse\..*|nfs.*|cifs|smbfs|virtiofs|sshfs|gvfs|davfs'
+    rm -f "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+}
+
+# --- Empty scan → no alert, last-scan timestamp written ---
+reset_stale_state
+set_mock_stale ""
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+if [[ -z "$ALERT_LOG" && -f "$TEST_TMP/stale.last-scan" ]]; then
+    test_result "Stale empty scan → no alert, last-scan updated" "pass"
+else
+    test_result "Stale empty scan → no alert, last-scan updated" "fail"
+fi
+
+# --- Non-empty scan → exactly one summary alert with count and total ---
+reset_stale_state
+set_mock_stale \
+    "2147483648	1700000000	/home/steve/iso/old.iso" \
+    "1073741824	1690000000	/home/steve/vm/dev.qcow2"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# Exactly one alert line, mentions count "2" and "stale-files" type
+alert_count=$(echo -e "$ALERT_LOG" | grep -c "^stale-files|" || true)
+if (( alert_count == 1 )) && [[ "$ALERT_LOG" == *"2 large stale files"* ]]; then
+    test_result "Stale non-empty scan → exactly one summary alert (count, total)" "pass"
+else
+    test_result "Stale non-empty scan → exactly one summary alert (count, total)" "fail"
+fi
+
+# --- Config ignore (prefix-style) filters whole subtree ---
+reset_stale_state
+STALE_FILES_IGNORE=("/home/steve/.cache")
+set_mock_stale \
+    "2147483648	1700000000	/home/steve/.cache/big.dat" \
+    "1073741824	1690000000	/home/steve/vm/keep.qcow2"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# Only the qcow2 should remain in the alert (1 file)
+if [[ "$ALERT_LOG" == *"1 large stale files"* ]] && [[ -f "$TEST_TMP/stale.report" ]] \
+    && ! grep -q '.cache/big.dat' "$TEST_TMP/stale.report" \
+    && grep -q 'vm/keep.qcow2' "$TEST_TMP/stale.report"; then
+    test_result "Stale ignore (prefix): subtree filtered out" "pass"
+else
+    test_result "Stale ignore (prefix): subtree filtered out" "fail"
+fi
+
+# --- Config ignore (glob) filters matching paths ---
+reset_stale_state
+STALE_FILES_IGNORE=("/home/steve/iso/*.iso")
+set_mock_stale \
+    "2147483648	1700000000	/home/steve/iso/ubuntu.iso" \
+    "1073741824	1690000000	/home/steve/iso/dvd.img"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# Only the .img should remain (1 file)
+if [[ "$ALERT_LOG" == *"1 large stale files"* ]] \
+    && grep -q 'dvd.img' "$TEST_TMP/stale.report" \
+    && ! grep -q 'ubuntu.iso' "$TEST_TMP/stale.report"; then
+    test_result "Stale ignore (glob): matching paths filtered out" "pass"
+else
+    test_result "Stale ignore (glob): matching paths filtered out" "fail"
+fi
+
+# --- All files filtered → no alert ---
+reset_stale_state
+STALE_FILES_IGNORE=("/home/steve/iso")
+set_mock_stale \
+    "2147483648	1700000000	/home/steve/iso/ubuntu.iso" \
+    "1073741824	1690000000	/home/steve/iso/dvd.img"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Stale ignore: all filtered → no alert" "pass"
+else
+    test_result "Stale ignore: all filtered → no alert" "fail"
+fi
+
+# --- Ack filters specific path ---
+reset_stale_state
+now_ts="$(date +%s)"
+printf '%s\t%s\n' "$now_ts" "/home/steve/iso/ubuntu.iso" > "$TEST_TMP/stale.acks"
+set_mock_stale \
+    "2147483648	1700000000	/home/steve/iso/ubuntu.iso" \
+    "1073741824	1690000000	/home/steve/vm/dev.qcow2"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+if [[ "$ALERT_LOG" == *"1 large stale files"* ]] \
+    && ! grep -q 'ubuntu.iso' "$TEST_TMP/stale.report" \
+    && grep -q 'dev.qcow2' "$TEST_TMP/stale.report"; then
+    test_result "Stale ack: acked path filtered, others remain" "pass"
+else
+    test_result "Stale ack: acked path filtered, others remain" "fail"
+fi
+
+# --- Ack TTL expiry: stale ack drops, path reappears ---
+reset_stale_state
+expired_ts=$(( $(date +%s) - 100 * 86400 ))   # 100 days ago, > TTL of 90
+printf '%s\t%s\n' "$expired_ts" "/home/steve/iso/ubuntu.iso" > "$TEST_TMP/stale.acks"
+set_mock_stale "2147483648	1700000000	/home/steve/iso/ubuntu.iso"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# File should NOT be filtered (ack expired), AND ack file should no longer contain that path
+if [[ "$ALERT_LOG" == *"1 large stale files"* ]] \
+    && grep -q 'ubuntu.iso' "$TEST_TMP/stale.report" \
+    && ! grep -q 'ubuntu.iso' "$TEST_TMP/stale.acks"; then
+    test_result "Stale ack TTL: expired ack drops, path reappears, ack file pruned" "pass"
+else
+    test_result "Stale ack TTL: expired ack drops, path reappears, ack file pruned" "fail"
+fi
+
+# --- stale_files_ack appends entry; stale_files_unack removes it ---
+reset_stale_state
+rm -f "$TEST_TMP/stale.acks"
+stale_files_ack "$TEST_TMP/stale.acks" "/home/steve/big.iso"
+if [[ -f "$TEST_TMP/stale.acks" ]] && grep -qF '/home/steve/big.iso' "$TEST_TMP/stale.acks"; then
+    test_result "stale_files_ack: appends path to ack file" "pass"
+else
+    test_result "stale_files_ack: appends path to ack file" "fail"
+fi
+stale_files_unack "$TEST_TMP/stale.acks" "/home/steve/big.iso"
+if ! grep -qF '/home/steve/big.iso' "$TEST_TMP/stale.acks" 2>/dev/null; then
+    test_result "stale_files_unack: removes path from ack file" "pass"
+else
+    test_result "stale_files_unack: removes path from ack file" "fail"
+fi
+
+# --- ack file with corrupt lines: starts fresh, no crash ---
+reset_stale_state
+printf 'garbage\nno-tab-here\nbad:line\n' > "$TEST_TMP/stale.acks"
+set_mock_stale "2147483648	1700000000	/home/steve/iso/keep.iso"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+if [[ "$ALERT_LOG" == *"1 large stale files"* ]]; then
+    test_result "Stale ack: corrupt ack file tolerated, scan proceeds" "pass"
+else
+    test_result "Stale ack: corrupt ack file tolerated, scan proceeds" "fail"
+fi
+
+# --- Mount-prune: FUSE/nfs mounts under root pruned; ext4 not pruned ---
+set_mock_findmnt() {
+    _STALE_FINDMNT_CMD="_mock_findmnt_output"
+    _MOCK_FINDMNT_DATA="$(printf '%s\n' "$@")"
+}
+_mock_findmnt_output() {
+    [[ -n "${_MOCK_FINDMNT_DATA:-}" ]] && printf '%s\n' "$_MOCK_FINDMNT_DATA"
+    return 0
+}
+
+reset_stale_state
+set_mock_findmnt \
+    "/home/steve ext4" \
+    "/home/steve/gdrive fuse.rclone" \
+    "/home/steve/nfs-share nfs4" \
+    "/home/steve/code ext4"
+excluded="$(_stale_excluded_mounts_under "/home/steve" 2>&1 || true)"
+if [[ "$excluded" == *"/home/steve/gdrive"* ]] \
+    && [[ "$excluded" == *"/home/steve/nfs-share"* ]] \
+    && [[ "$excluded" != *"/home/steve/code"* ]] \
+    && [[ "$excluded" != "/home/steve"$'\n'* && "$excluded" != "/home/steve" ]]; then
+    test_result "Stale mount-prune: fuse.* and nfs mounts excluded, ext4 retained" "pass"
+else
+    test_result "Stale mount-prune: fuse.* and nfs mounts excluded, ext4 retained" "fail"
+fi
+
+# --- Mount-prune: mountpoints outside scan root ignored ---
+reset_stale_state
+set_mock_findmnt \
+    "/home/steve ext4" \
+    "/mnt/external fuse.rclone" \
+    "/home/steve/gdrive fuse.rclone"
+excluded="$(_stale_excluded_mounts_under "/home/steve" 2>&1 || true)"
+if [[ "$excluded" == *"/home/steve/gdrive"* ]] \
+    && [[ "$excluded" != *"/mnt/external"* ]]; then
+    test_result "Stale mount-prune: out-of-root mountpoints ignored" "pass"
+else
+    test_result "Stale mount-prune: out-of-root mountpoints ignored" "fail"
+fi
+
+# --- Prune-clause builder: produces -path clauses for excluded mounts ---
+reset_stale_state
+set_mock_findmnt \
+    "/home/steve ext4" \
+    "/home/steve/gdrive fuse.rclone"
+_stale_build_prune_clauses "/home/steve" expr
+if [[ "$expr" == *"-path"* ]] && [[ "$expr" == *"/home/steve/gdrive"* ]]; then
+    test_result "Stale mount-prune: build_prune_clauses emits -path for excluded mounts" "pass"
+else
+    test_result "Stale mount-prune: build_prune_clauses emits -path for excluded mounts" "fail"
+fi
+
+# --- Prune-clause builder: empty when no exclusions ---
+reset_stale_state
+set_mock_findmnt "/home/steve ext4"
+_stale_build_prune_clauses "/home/steve" expr
+if [[ -z "$expr" ]]; then
+    test_result "Stale mount-prune: build_prune_clauses empty when no exclusions" "pass"
+else
+    test_result "Stale mount-prune: build_prune_clauses empty when no exclusions" "fail"
+fi
+
+# --- Prune-clause builder: folds literal-prefix ignores into find prune list ---
+reset_stale_state
+set_mock_findmnt "/home/steve ext4"
+STALE_FILES_IGNORE=("/home/steve/.cache" "/home/steve/*.tmp")   # 1 literal + 1 glob
+_stale_build_prune_clauses "/home/steve" expr
+# Literal prefix should appear; globby pattern should NOT (handled by post-filter)
+if [[ "$expr" == *"/home/steve/.cache"* ]] && [[ "$expr" != *"*.tmp"* ]]; then
+    test_result "Stale mount-prune: folds literal-prefix ignores, skips globs" "pass"
+else
+    test_result "Stale mount-prune: folds literal-prefix ignores, skips globs" "fail"
+fi
+
+# --- Report contains SIZE/AGE/PATH columns and entries are sorted desc by size ---
+reset_stale_state
+set_mock_stale \
+    "1073741824	1690000000	/home/steve/small.bin" \
+    "5368709120	1700000000	/home/steve/big.bin" \
+    "2147483648	1695000000	/home/steve/med.bin"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# Check that header row exists
+if grep -qE '^  SIZE +AGE +PATH' "$TEST_TMP/stale.report"; then
+    test_result "Stale report: header row SIZE/AGE/PATH present" "pass"
+else
+    test_result "Stale report: header row SIZE/AGE/PATH present" "fail"
+fi
+# Check ordering: big.bin should appear before med.bin, which appears before small.bin
+big_line="$(grep -n big.bin "$TEST_TMP/stale.report" | head -1 | cut -d: -f1)"
+med_line="$(grep -n med.bin "$TEST_TMP/stale.report" | head -1 | cut -d: -f1)"
+small_line="$(grep -n small.bin "$TEST_TMP/stale.report" | head -1 | cut -d: -f1)"
+if [[ -n "$big_line" && -n "$med_line" && -n "$small_line" ]] \
+    && (( big_line < med_line )) && (( med_line < small_line )); then
+    test_result "Stale report: entries sorted by size desc" "pass"
+else
+    test_result "Stale report: entries sorted by size desc" "fail"
+fi
+
+# --- Report cap honored when entry count exceeds STALE_FILES_MAX_REPORT_ENTRIES ---
+reset_stale_state
+STALE_FILES_MAX_REPORT_ENTRIES=3
+mock_lines=()
+for i in {1..10}; do
+    # decreasing sizes so sort order is predictable
+    size=$(( (11 - i) * 1073741824 ))
+    mock_lines+=( "${size}	1700000000	/path/file${i}.bin" )
+done
+set_mock_stale "${mock_lines[@]}"
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+# Should contain exactly 3 entries; truncation note should mention 10 total
+entry_count=$(grep -cE '^  [0-9]+\.[0-9]+ [GMK]?i?B  ' "$TEST_TMP/stale.report" || true)
+if (( entry_count == 3 )) && grep -q "top 3 of 10" "$TEST_TMP/stale.report"; then
+    test_result "Stale report: respects STALE_FILES_MAX_REPORT_ENTRIES cap" "pass"
+else
+    test_result "Stale report: respects STALE_FILES_MAX_REPORT_ENTRIES cap" "fail"
+fi
+
+# --- Empty scan: report still written with 'No stale files found' ---
+reset_stale_state
+set_mock_stale ""
+stale_files_check "$TEST_TMP/stale.report" "$TEST_TMP/stale.last-scan" "$TEST_TMP/stale.acks"
+if [[ -f "$TEST_TMP/stale.report" ]] && grep -q 'No stale files found' "$TEST_TMP/stale.report"; then
+    test_result "Stale report: empty scan still writes report with placeholder" "pass"
+else
+    test_result "Stale report: empty scan still writes report with placeholder" "fail"
+fi
+
+# --- stale_files_report prints report contents ---
+reset_stale_state
+echo "test report contents here" > "$TEST_TMP/stale.report"
+out="$(stale_files_report "$TEST_TMP/stale.report")"
+if [[ "$out" == *"test report contents here"* ]]; then
+    test_result "stale_files_report: prints report file contents" "pass"
+else
+    test_result "stale_files_report: prints report file contents" "fail"
+fi
+
+# --- stale_files_report prints message when no report exists ---
+reset_stale_state
+rm -f "$TEST_TMP/stale.report"
+out="$(stale_files_report "$TEST_TMP/stale.report")"
+if [[ "$out" == *"No stale-files report"* ]]; then
+    test_result "stale_files_report: handles missing report gracefully" "pass"
+else
+    test_result "stale_files_report: handles missing report gracefully" "fail"
+fi
+
 # ── Integration Tests ─────────────────────────────────────────────────
 
 echo ""
@@ -893,7 +1350,7 @@ for f in bin lib etc test; do
     fi
 done
 
-for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
+for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/stale-files-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
     if [[ -f "$PROJECT_DIR/$f" ]]; then
         test_result "File $f exists" "pass"
     else

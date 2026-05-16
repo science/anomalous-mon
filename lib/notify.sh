@@ -86,6 +86,51 @@ send_alert() {
     return 0
 }
 
+# Send an interactive notification with a clickable action button.
+# Click handling is delegated to a detached systemd-run scope so it survives
+# the parent script exit (notify-send --wait blocks until close/click).
+#
+# Args:
+#   $1 type          (e.g. "stale-files")
+#   $2 key           (in-memory dedup, like send_alert)
+#   $3 message       (notification body)
+#   $4 button_label  (e.g. "Open report")
+#   $5 action_cmd    (shell command to run if the button is clicked)
+#
+# WARNING: $5 is eval'd. Quote paths with ${PATH@Q} when constructing.
+send_alert_action() {
+    local type="$1" key="$2" message="$3" button_label="$4" action_cmd="$5"
+
+    if [[ -n "${_ACTIVE_ALERTS[$key]:-}" ]]; then
+        return 1
+    fi
+    _ACTIVE_ALERTS[$key]=1
+
+    local timestamp
+    timestamp="[$(date +%H:%M)]"
+    local summary="anomalous-mon: ${type}"
+    local body="${timestamp} ${message}"
+
+    if command -v systemd-run >/dev/null 2>&1; then
+        # Slugify the key so it's a valid systemd unit name.
+        local slug="${key//[^a-zA-Z0-9]/_}"
+        systemd-run --user --no-block --quiet \
+            --unit="anomalous-mon-notify-${slug}-$$" \
+            bash -c '
+                result=$(notify-send --wait \
+                    --urgency=normal -i dialog-information \
+                    --action="action=$1" "$2" "$3" 2>/dev/null)
+                [[ "$result" == "action" ]] && eval "$4"
+            ' _ "$button_label" "$summary" "$body" "$action_cmd"
+    elif command -v notify-send >/dev/null 2>&1; then
+        # Fallback: fire-and-forget bubble without the action button.
+        notify-send --urgency=normal -i dialog-information "$summary" "$body"
+    fi
+
+    echo "[ALERT] ${type}: ${message}"
+    return 0
+}
+
 # Clear an active alert, allowing re-notification if it triggers again.
 # Args: $1=key
 clear_alert() {

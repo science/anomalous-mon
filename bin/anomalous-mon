@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # anomalous-mon — Desktop anomaly monitor
 #
-# Monitors for sustained CPU hogging and OOM kills on a Linux workstation.
-# Designed to run as a systemd user timer (every 60s).
+# Monitors for sustained CPU hogging, OOM kills, disk-space pressure, and
+# large stale files. Designed to run as a systemd user timer.
 #
 # Usage:
-#   anomalous-mon           Run one monitoring cycle
-#   anomalous-mon --status  Show current tracking state
+#   anomalous-mon                Run one monitoring cycle (5s timer)
+#   anomalous-mon --status       Show current tracking state
+#   anomalous-mon --stale-scan   Run the weekly stale-files scan
+#   anomalous-mon --stale-report Print the latest stale-files report
+#   anomalous-mon --ack <path>   Mark a file as acked (silence in scans)
+#   anomalous-mon --unack <path> Remove an ack for a file
 
 set -euo pipefail
 
@@ -21,6 +25,7 @@ source "$PROJECT_DIR/lib/notify.sh"
 source "$PROJECT_DIR/lib/cpu-monitor.sh"
 source "$PROJECT_DIR/lib/journal-monitor.sh"
 source "$PROJECT_DIR/lib/disk-monitor.sh"
+source "$PROJECT_DIR/lib/stale-files-monitor.sh"
 
 # Runtime state files
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
@@ -29,20 +34,64 @@ JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
 JOURNAL_ALERT_FILE="${STATE_DIR}/anomalous-mon.oom-alerts"
 DISK_ALERT_FILE="${STATE_DIR}/anomalous-mon.disk-alerts"
 NOTIFY_ID_FILE="${STATE_DIR}/anomalous-mon.notify-ids"
+STALE_REPORT_FILE="${STATE_DIR}/anomalous-mon.stale-report"
+STALE_LAST_SCAN_FILE="${STATE_DIR}/anomalous-mon.stale-last-scan"
 
-# Handle --status
-if [[ "${1:-}" == "--status" ]]; then
-    cpu_status "$CPU_STATE_FILE"
-    echo ""
-    if [[ -f "$JOURNAL_CURSOR_FILE" ]]; then
-        echo "Journal cursor: $(cat "$JOURNAL_CURSOR_FILE")"
-    else
-        echo "Journal cursor: none (will scan recent window on next run)"
-    fi
-    echo ""
-    disk_status "$DISK_ALERT_FILE" "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB"
-    exit 0
-fi
+# Persistent state (must survive logout — XDG_RUNTIME_DIR is wiped on logout)
+STALE_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/anomalous-mon"
+STALE_ACK_FILE="${STALE_STATE_DIR}/stale-acks"
+mkdir -p "$STALE_STATE_DIR" 2>/dev/null || true
+
+# CLI dispatcher
+case "${1:-}" in
+    --status)
+        cpu_status "$CPU_STATE_FILE"
+        echo ""
+        if [[ -f "$JOURNAL_CURSOR_FILE" ]]; then
+            echo "Journal cursor: $(cat "$JOURNAL_CURSOR_FILE")"
+        else
+            echo "Journal cursor: none (will scan recent window on next run)"
+        fi
+        echo ""
+        disk_status "$DISK_ALERT_FILE" "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB"
+        echo ""
+        stale_files_status "$STALE_REPORT_FILE" "$STALE_LAST_SCAN_FILE" "$STALE_ACK_FILE"
+        exit 0
+        ;;
+    --stale-scan)
+        stale_files_check "$STALE_REPORT_FILE" "$STALE_LAST_SCAN_FILE" "$STALE_ACK_FILE"
+        exit 0
+        ;;
+    --stale-report)
+        stale_files_report "$STALE_REPORT_FILE"
+        exit 0
+        ;;
+    --ack)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: anomalous-mon --ack <path>" >&2
+            exit 2
+        fi
+        stale_files_ack "$STALE_ACK_FILE" "$2"
+        echo "Acked: $2"
+        exit 0
+        ;;
+    --unack)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: anomalous-mon --unack <path>" >&2
+            exit 2
+        fi
+        stale_files_unack "$STALE_ACK_FILE" "$2"
+        echo "Unacked: $2"
+        exit 0
+        ;;
+    "")
+        ;;  # fall through to the normal monitoring cycle
+    *)
+        echo "Unknown flag: $1" >&2
+        echo "Usage: anomalous-mon [--status|--stale-scan|--stale-report|--ack PATH|--unack PATH]" >&2
+        exit 2
+        ;;
+esac
 
 # Run one monitoring cycle
 cpu_sample "$CPU_STATE_FILE" "$CPU_THRESHOLD" "$CPU_THRESHOLD_TOTAL"

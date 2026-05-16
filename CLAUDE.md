@@ -10,6 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Inspect current tracking state:** `bin/anomalous-mon --status`.
 - **Tail live logs:** `journalctl --user -u anomalous-mon -f`.
 - **Force a timer-driven run now:** `systemctl --user start anomalous-mon.service`.
+- **Run the weekly stale-files scan ad-hoc:** `bin/anomalous-mon --stale-scan` (also fires via `anomalous-mon-stale.timer` weekly).
+- **Print the latest stale-files report:** `bin/anomalous-mon --stale-report`.
+- **Silence a file the stale-scan keeps flagging:** `bin/anomalous-mon --ack /path/to/file` (or `--unack` to reverse).
 
 There is no build step, no linter, no lockfile. Pure bash + coreutils + sysstat (`pidstat`) + systemd + `notify-send`.
 
@@ -70,6 +73,36 @@ Two severities per mount, computed fresh each tick from `df --output=target,fsty
 
 **Float comparisons.** Bash `(( ))` can't compare floats, and `MIN_FREE_GB` can be fractional (e.g. `0.1` for `/boot`). `_disk_lt` and `_disk_kb_to_gb` shell out to `awk` for the float work; the integer comparisons (pcent vs. warn/crit) stay in native bash.
 
+### Stale large-files monitor (`lib/stale-files-monitor.sh`)
+
+A **separate weekly timer** (`anomalous-mon-stale.{service,timer}`, `OnCalendar=Mon 03:00` with `RandomizedDelaySec=2h`, `Persistent=true`). Not invoked from the 5s loop — a filesystem walk every 5s would be absurd. The main binary's `--stale-scan` flag is the service entrypoint.
+
+Pipeline per scan: `find` → ignore filter → ack filter → summarize + alert → write report.
+
+**`find` invocation.** Per scan root, with `-xdev` to keep within one filesystem, plus an auto-built `-prune` group for FUSE/network mount targets that sit under the root. Output is `size_bytes\tmtime_epoch\tpath`. Wrapped in `nice -n 19 ionice -c 3` to stay polite. `LC_ALL=C` so `%T@` is dot-formatted under non-C locales. Uses `+${N}G` size syntax (readable; rounding imprecision is fine for "looking for big").
+
+**Mount auto-prune.** `_stale_excluded_mounts_under` reads `findmnt --raw -lo TARGET,FSTYPE`, keeps mounts under the scan root whose fstype matches `STALE_FILES_FSTYPE_EXCLUDE` (`fuse.*|nfs.*|cifs|smbfs|virtiofs|sshfs|gvfs|davfs`). `_stale_build_prune_clauses` then folds those targets, plus any **literal-prefix** entries from `STALE_FILES_IGNORE`, into a `-path X -o -path Y -o ...` group that `find` skips before descending. Globby ignore entries stay as a post-filter in the read loop.
+
+**Ignore vs ack.** Two-tier silencing:
+- `STALE_FILES_IGNORE` (config array): permanent, supports glob and prefix subtree. Matched via `[[ $path == $pat ]] || [[ $path == $pat/* ]]`.
+- Ack file (runtime): per-path with TTL. Lives under `${XDG_STATE_HOME:-$HOME/.local/state}/anomalous-mon/stale-acks` — **persistent**, not under `XDG_RUNTIME_DIR` (which is wiped on logout). Format `<epoch>\t<path>`. On load, entries older than `STALE_FILES_ACK_TTL` days are silently dropped and pruned from the saved file.
+
+**Single summary alert.** One scan emits one `send_alert_action` call: *"Found N large stale files (X GB total). Click 'Open report' or run 'anomalous-mon --stale-report'."* No grouping (weekly cadence makes replace-id pointless). The action button opens the report file via `xdg-open`. If `send_alert_action` isn't defined (shouldn't happen post-install), falls back to `send_alert`.
+
+**Report format.** Written to `${STATE_DIR}/anomalous-mon.stale-report`: header (timestamp, scan params, root list, ack count), then sorted-desc-by-size table of `SIZE / AGE / PATH`, capped at `STALE_FILES_MAX_REPORT_ENTRIES` (default 50). Empty scan still writes the report with "No stale files found." so `--stale-report` always shows something coherent.
+
+**mtime, not atime.** Documented caveat: relatime/noatime make atime unreliable, so a file you `cat` daily but never edit looks stale. This is intentional — large read-only files (ISOs, VM images, archives) are exactly what we want to surface.
+
+### Clickable notifications (`lib/notify.sh`'s `send_alert_action`)
+
+Companion to `send_alert`. Same fire-and-forget contract from the caller's perspective, but spawns a **transient systemd-run scope** (`systemd-run --user --no-block --quiet --unit=anomalous-mon-notify-<slug>-<pid>`) running a small bash that invokes `notify-send --wait --action="action=<label>" ...`. When the user clicks the action button, notify-send prints `action` to stdout, the inner bash `eval`s the `ACTION_CMD`. When the bubble is dismissed (X button or daemon expiry) without action, the eval is skipped and the unit cleans up.
+
+Why systemd-run: `Type=oneshot` services take their cgroup with them when the main PID exits, which would kill a backgrounded `notify-send --wait`. The transient unit is independent.
+
+Fallback path: if `systemd-run` isn't available, emits a regular `notify-send` bubble with no `--wait` and no action button. Log line always fires (journal audit trail independent of click handling).
+
+**Security note.** `ACTION_CMD` is `eval`'d in the transient scope. Quote paths with `${PATH@Q}` when constructing. Never interpolate untrusted data.
+
 ### Test mocking model (`test/test-anomalous-mon.sh`)
 
 The libs are designed to be sourced and mocked:
@@ -77,6 +110,8 @@ The libs are designed to be sourced and mocked:
 - `_CPU_SAMPLE_CMD` — override `_cpu_sample_cmd` with a function returning fake `pid %cpu comm args` lines. `set_mock_ps "..."` is a convenience helper.
 - `_JOURNAL_CMD` — override `_journal_cmd` with a function returning fake journalctl JSON.
 - `_DISK_SAMPLE_CMD` — override `_disk_sample_cmd` with a function returning fake `target fstype pcent avail_kb` lines (one per mount). `set_mock_disk "..."` is the convenience helper.
+- `_STALE_FILES_SCAN_CMD` — override `_stale_files_scan_cmd` with a function returning fake `size_bytes<TAB>mtime_epoch<TAB>path` lines. `set_mock_stale "..."` is the convenience helper.
+- `_STALE_FINDMNT_CMD` — override `_stale_findmnt_cmd` for mount-prune testing. Emits `target<SPACE>fstype` lines. `set_mock_findmnt "..."` is the convenience helper.
 - `_NPROC` — override `nproc` for deterministic total-CPU threshold math (fixed to 4 in tests).
 
 There are two flavors of `send_alert` in the test file:
@@ -94,6 +129,14 @@ All under `${XDG_RUNTIME_DIR:-/tmp}`:
 | `anomalous-mon.oom-alerts` | OOM cooldown state | `<key>:<epoch>` per line |
 | `anomalous-mon.disk-alerts` | Disk WARN/CRITICAL cooldown state | `disk:<mount>:<severity>:<epoch>` per line; `<severity>` is `warn` or `critical`. Parsed with `${line%:*}` / `${line##*:}` so a key with embedded colons like `disk:/:warn` still splits correctly. |
 | `anomalous-mon.notify-ids` | group → notify-send id | `<group>\t<id>` per line |
+| `anomalous-mon.stale-report` | Stale-files: latest human-readable report | header + sorted SIZE/AGE/PATH table; regenerated each scan |
+| `anomalous-mon.stale-last-scan` | Stale-files: timestamp of last scan | single epoch |
+
+Plus **one persistent file** outside `XDG_RUNTIME_DIR` (would be lost on logout otherwise):
+
+| File | Purpose | Format |
+|---|---|---|
+| `${XDG_STATE_HOME:-$HOME/.local/state}/anomalous-mon/stale-acks` | Stale-files ack list, per-path TTL silencing | `<epoch>\t<path>` per line. Expired entries pruned on next load. |
 
 Corrupt state files are tolerated: the loaders parse defensively and fall through to empty state on garbage (tested).
 
