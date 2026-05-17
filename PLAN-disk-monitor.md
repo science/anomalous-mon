@@ -1,5 +1,7 @@
 # Disk-space warning module for anomalous-mon
 
+> **Status: Implemented** in `lib/disk-monitor.sh` (commit `d54f8f3`). Kept as historical context for the WARN/CRITICAL severity rules and the AND-gate rationale.
+
 ## Context
 
 dev-1 just hit 100% disk (39 GB used / 1.1 MB free) and wedged the shell — the

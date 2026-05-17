@@ -1,5 +1,7 @@
 # PLAN: Add `service-monitor.sh` — alert on user/system unit not-active
 
+> **Status: Pending** (as of 2026-05-16). Not yet implemented. Pick this up when ready for the next monitor.
+
 ## Context
 
 Suspend on the user's workstation depends on `xidlehook.service` (a user systemd unit) staying alive. It has SEGV'd twice in 10 days and was once manually stopped during diagnosis and forgotten — leaving suspend silently broken for 12 days. There is no existing visibility on "this service is dead."

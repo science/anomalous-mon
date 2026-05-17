@@ -149,5 +149,7 @@ Corrupt state files are tolerated: the loaders parse defensively and fall throug
 ## Design docs at repo root
 
 - `PLAN.md` — original project plan.
-- `PLAN-<feature>.md` — per-feature design plans, written before implementation (e.g. `PLAN-disk-monitor.md`, `PLAN-service-monitor.md`). Read the matching plan before working on a feature — it captures the rationale that the code itself doesn't.
-- `FINDINGS-<topic>-<date>.md` — diagnostic write-ups of incidents that motivated (or could have been caught by) a monitor. Useful context when designing new checks; often paired with a `PLAN-*.md` for the resulting feature.
+- `PLAN-<feature>.md` — per-feature design plans, written *before* implementation. Each starts with a **Status:** banner (`Implemented` vs `Pending`) — a `PLAN-*.md` for a shipped feature is kept around as historical design context (rationale that the code itself doesn't capture), not as an open todo. Examples: `PLAN-disk-monitor.md` (Implemented), `PLAN-service-monitor.md` (Pending).
+- `FINDINGS-<topic>-<date>.md` — diagnostic write-ups of incidents that motivated (or could have been caught by) a monitor. Useful context when designing new checks; often paired with a `PLAN-*.md` for the resulting feature (e.g. `FINDINGS-lock-failure-2026-05-02.md` motivates `PLAN-service-monitor.md`).
+
+When you start a new feature, write a `PLAN-<feature>.md` first with `Status: Pending`. When it ships, flip the banner to `Status: Implemented` and add a pointer to the implementing file/commit. Don't delete it — the original design rationale is often the most useful breadcrumb six months later.

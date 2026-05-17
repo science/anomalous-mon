@@ -1,5 +1,7 @@
 # anomalous-mon: Desktop Anomaly Monitor
 
+> **Status: Implemented.** The CPU and journal/OOM monitoring features outlined here ship in `lib/cpu-monitor.sh`, `lib/journal-monitor.sh`, and `lib/notify.sh`. Kept as historical context for the original design rationale.
+
 ## Why this exists
 
 On 2026-03-09, an rclone mount service (`gdrive-lt`) on a Linux Mint workstation (32GB RAM, `linux-bambam`) grew to 1.9GB RSS. Go's garbage collector entered a continuous collection loop at 193% CPU because `GOMEMLIMIT=1750MiB` left only 250MB of headroom before the `MemoryMax=2G` systemd hard kill. The problem was only noticed manually when the machine felt sluggish.
