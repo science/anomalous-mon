@@ -71,13 +71,27 @@ anomalous-mon --unack /path/to/file # un-silence
 anomalous-mon --status              # includes stale-files state alongside CPU/disk
 ```
 
+## rclone shortcut-cycle scanner (standalone)
+
+`bin/rclone-cycle-scan` is a **separate on-demand utility**, not part of the monitoring loop. Use it when an rclone Google Drive mount mysteriously OOM-kills or restarts (anomalous-mon's OOM alert fires). The usual cause is a **self-referential Drive shortcut** — a shortcut whose target is one of its own ancestor folders — which makes the mount present an infinitely deep directory tree; any recursive walk grows rclone's VFS heap until it OOMs. rclone has no cycle detection, so this scans the **remote** (Drive API, in a separate process — it never touches the live mount or its caches) to a bounded depth and names the exact shortcut to move in the Drive web UI.
+
+```bash
+bin/rclone-cycle-scan                          # scan gdrive-lt: + gdrive-personal:, depth 8
+bin/rclone-cycle-scan gdrive-lt: --max-depth 12
+bin/rclone-cycle-scan "gdrive-lt:Some/Subtree" # scan one subtree, deeper
+bin/rclone-cycle-scan --json                   # machine-readable output
+```
+
+Scans remotes in parallel (~9 min for both). Exit codes: `0` clean, `1` cycles found, `2` scan failed. It reports the loop-back shortcut to move — it does not auto-fix. Background and the motivating incident: `FINDINGS-rclone-oom-2026-06-09.md`; design rationale (why on-demand, not a weekly timer) in `PLAN-cycle-monitor.md`.
+
 ## Tests
 
 ```bash
-./test/test-anomalous-mon.sh
+./test/test-anomalous-mon.sh                   # bash: CPU/OOM/disk/stale/notify logic
+pytest test/test_rclone_cycle_scan.py          # python: rclone-cycle-scan detection logic
 ```
 
-Covers CPU dual-track logic, journal monitoring, disk WARN/CRITICAL severity gating, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios.
+The bash suite covers CPU dual-track logic, journal monitoring, disk WARN/CRITICAL severity gating, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios. The pytest suite covers the shortcut-cycle detector (self-loops, multi-hop loops, false-positive guards, loop-unrolling dedup).
 
 ## Design
 

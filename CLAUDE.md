@@ -13,8 +13,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Run the weekly stale-files scan ad-hoc:** `bin/anomalous-mon --stale-scan` (also fires via `anomalous-mon-stale.timer` weekly).
 - **Print the latest stale-files report:** `bin/anomalous-mon --stale-report`.
 - **Silence a file the stale-scan keeps flagging:** `bin/anomalous-mon --ack /path/to/file` (or `--unack` to reverse).
+- **Hunt an rclone shortcut-cycle (after a gdrive OOM alert):** `bin/rclone-cycle-scan` — scans `gdrive-lt:` + `gdrive-personal:` for self-referential Drive shortcuts that loop forever and OOM the mount; names the exact shortcut to move. See "Standalone tool" below.
+- **Run the Python tests:** `pytest test/test_rclone_cycle_scan.py` (only the `rclone-cycle-scan` logic; everything else is bash).
 
-There is no build step, no linter, no lockfile. Pure bash + coreutils + sysstat (`pidstat`) + systemd + `notify-send`.
+There is no build step, no linter, no lockfile. Mostly bash + coreutils + sysstat (`pidstat`) + systemd + `notify-send`. The one exception is `bin/rclone-cycle-scan` (Python 3 stdlib only; shells out to `rclone`).
+
+## Standalone tool: `bin/rclone-cycle-scan`
+
+Not part of the 5 s monitoring loop — a **separate on-demand utility**. Reach for it when an rclone gdrive mount mysteriously OOM-kills / restarts (anomalous-mon's journal OOM alert fires). The cause is usually a **self-referential Google Drive shortcut** — a shortcut whose target is one of its own ancestor folders — which makes the mount present an infinitely deep tree; any recursive walk grows rclone's VFS heap until `MemoryMax` OOMs it. rclone has no cycle detection and `rclone mount` ignores `--max-depth`, so this scans the **remote** (Drive API, separate process — never the live mount, so it doesn't disturb the dir/VFS caches) to a bounded depth and reports the cyclic shortcut to move in the Drive web UI.
+
+```
+bin/rclone-cycle-scan                       # scan the two default remotes, depth 8
+bin/rclone-cycle-scan gdrive-lt: --max-depth 12
+bin/rclone-cycle-scan "gdrive-lt:Some/Subtree"   # scan one subtree deeper
+```
+
+Runs the two remotes in **parallel** (different Google accounts → independent API quotas; ~9 min wall-clock for both). Exit codes: `0` clean, `1` cycles found, `2` a scan failed. Detection logic (`detect_cycles`) is pure and unit-tested in `test/test_rclone_cycle_scan.py`. Full background + the incident that motivated it: `FINDINGS-rclone-oom-2026-06-09.md` and `PLAN-cycle-monitor.md` (which records *why* this is on-demand rather than a weekly timer). It does **not** auto-fix — you move/remove the shortcut in the Drive UI.
 
 ## Deployment model
 

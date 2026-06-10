@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""rclone-cycle-scan — find self-referential Google Drive shortcut cycles.
+
+A *cyclic* shortcut is one whose target is one of its own ancestor folders. rclone
+resolves shortcuts transparently, so such a shortcut makes the mount present an
+infinitely deep directory tree; any recursive walk then grows rclone's VFS heap
+without bound until the mount OOM-kills (cgroup MemoryMax). rclone has no cycle
+detection, and `rclone mount` ignores --max-depth, so the only way to find a cycle
+is an out-of-band, bounded-depth scan of the *remote*.
+
+This is an on-demand companion to anomalous-mon's OOM journal alert: when a gdrive
+mount OOM-kills, run this to find *which* shortcut caused it. It scans the REMOTE
+via the Drive API (a separate rclone process) and never touches the local mount,
+so it doesn't disturb the mount's dir-cache or its on-disk VFS file cache.
+
+See FINDINGS-rclone-oom-2026-06-09.md for the incident this was built from.
+
+Exit codes:
+    0  clean (no cycles found across all scanned remotes)
+    1  one or more cycles found
+    2  a scan failed (rclone error) — coverage is incomplete
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import shlex
+import subprocess
+import sys
+from collections import namedtuple
+
+DEFAULT_REMOTES = ["gdrive-lt:", "gdrive-personal:"]
+DEFAULT_MAX_DEPTH = 8
+DEFAULT_RCLONE_FLAGS = "--drive-skip-dangling-shortcuts"
+
+# One detected cycle. `path` is where the loop-back shortcut lives, `shortcut_id`
+# is the Drive object to move/remove, `target_id` is the ancestor it points back
+# into.
+Cycle = namedtuple("Cycle", "path target_id shortcut_id")
+
+
+class ScanError(Exception):
+    def __init__(self, remote, returncode, stderr):
+        self.remote = remote
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(f"{remote}: rclone exited {returncode}: {stderr}")
+
+
+def _ancestors(path):
+    """Yield each strict ancestor prefix of a /-separated path, shallowest first.
+
+    'a/b/c' -> 'a', 'a/b'  (not 'a/b/c' itself).
+    """
+    parts = path.split("/")
+    for i in range(1, len(parts)):
+        yield "/".join(parts[:i])
+
+
+def detect_cycles(lines):
+    """Pure cycle detector. Input: `rclone lsf --format ip --separator \\t` lines.
+
+    Each line is `id<TAB>path`. A *shortcut's* id field is itself
+    `targetID<TAB>shortcutID`, so a shortcut line carries 3 tab-fields. The
+    invariant we rely on: the path is always the LAST field, the effective
+    (target) id is always the FIRST field, and the shortcut id is the SECOND field
+    (for a plain folder, which has only 2 fields, the "shortcut id" is just its
+    own id — plain folders never form cycles anyway).
+
+    A cycle exists when a path's effective id equals the effective id of one of its
+    ancestors — i.e. following that path re-enters a folder already above it.
+
+    Returns a list of Cycle, one per distinct shortcut id (deduped to the
+    shallowest occurrence — the shortcut's real location; deeper repeats are just
+    the loop unrolling under itself), sorted by path.
+    """
+    effective_id = {}   # path -> effective (target) id (every entry)
+    shortcut_id = {}    # path -> shortcut id (shortcut entries only)
+    order = []          # shortcut paths in listing order (≈ shallow-to-deep)
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue  # malformed (e.g. id with no path) — skip defensively
+        path = fields[-1].rstrip("/")
+        if not path:
+            continue
+        effective_id[path] = fields[0]
+        # Only a shortcut (3-field line) is a loop-back edge we can act on. A
+        # plain folder reappearing under itself is a *symptom* of some shortcut
+        # higher in the loop, not a fixable thing — skip it as a candidate.
+        if len(fields) >= 3 and path not in shortcut_id:
+            shortcut_id[path] = fields[1]
+            order.append(path)
+
+    found = {}  # shortcut_id -> Cycle (keep shallowest path)
+    for path in order:
+        tid = effective_id[path]
+        for anc in _ancestors(path):
+            if anc != path and effective_id.get(anc) == tid:
+                sid = shortcut_id[path]
+                cand = Cycle(path=path, target_id=tid, shortcut_id=sid)
+                prev = found.get(sid)
+                if prev is None or path.count("/") < prev.path.count("/"):
+                    found[sid] = cand
+                break  # one match is enough to flag this path
+
+    return sorted(found.values(), key=lambda c: c.path)
+
+
+def _rclone_cmd(remote, max_depth, rclone_flags):
+    return [
+        "rclone", "lsf", remote,
+        "-R", "--dirs-only",
+        "--max-depth", str(max_depth),
+        "--format", "ip", "--separator", "\t",
+    ] + rclone_flags
+
+
+def scan_remote(remote, max_depth, rclone_flags):
+    """Run a bounded `rclone lsf` for one remote; return its output lines.
+
+    Raises ScanError on non-zero rclone exit so the caller can mark coverage
+    incomplete. LC_ALL=C keeps formatting locale-independent.
+    """
+    cmd = _rclone_cmd(remote, max_depth, rclone_flags)
+    env = dict(os.environ, LC_ALL="C")
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if proc.returncode != 0:
+        raise ScanError(remote, proc.returncode, proc.stderr.strip())
+    return proc.stdout.splitlines()
+
+
+def scan_and_detect(remote, max_depth, rclone_flags):
+    """Scan one remote and detect its cycles. Returns (remote, cycles, lines)."""
+    lines = scan_remote(remote, max_depth, rclone_flags)
+    return remote, detect_cycles(lines), len(lines)
+
+
+def _log(quiet, *msg):
+    if not quiet:
+        print(*msg, file=sys.stderr, flush=True)
+
+
+def run_scans(remotes, max_depth, rclone_flags, quiet=False):
+    """Scan all remotes in parallel. Returns (results, errors).
+
+    results: dict remote -> (cycles, dir_count)
+    errors:  dict remote -> ScanError
+    """
+    results, errors = {}, {}
+    _log(quiet, f"Scanning {len(remotes)} remote(s) at depth {max_depth} "
+                f"(remote API, not the mount)…")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(remotes)) as pool:
+        futures = {
+            pool.submit(scan_and_detect, r, max_depth, rclone_flags): r
+            for r in remotes
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            remote = futures[fut]
+            try:
+                _, cycles, n = fut.result()
+                results[remote] = (cycles, n)
+                _log(quiet, f"  {remote} done: {n} dirs, "
+                            f"{len(cycles)} cycle(s)")
+            except ScanError as e:
+                errors[remote] = e
+                _log(quiet, f"  {remote} FAILED: {e.stderr}")
+    return results, errors
+
+
+def format_report(remotes, max_depth, results, errors, timestamp=None):
+    out = []
+    out.append("=== rclone shortcut-cycle scan ===")
+    if timestamp:
+        out.append(f"scanned : {timestamp}")
+    out.append(f"remotes : {', '.join(remotes)}")
+    out.append(f"depth   : {max_depth}")
+    total = sum(len(c) for c, _ in results.values())
+    out.append("")
+
+    if errors:
+        out.append("!!! INCOMPLETE — these remotes failed to scan:")
+        for remote, e in sorted(errors.items()):
+            out.append(f"  {remote}: rclone exited {e.returncode}: {e.stderr}")
+        out.append("")
+
+    if total == 0:
+        out.append("No cycles found." if not errors
+                   else "No cycles found in the remotes that scanned.")
+    else:
+        out.append(f"Found {total} shortcut cycle(s). Move/remove the shortcut "
+                   f"(not the folder) in the Drive web UI to break each loop:")
+        out.append("")
+        for remote in sorted(results):
+            cycles, _ = results[remote]
+            for c in cycles:
+                out.append(f"  [{remote}] {c.path}")
+                out.append(f"      shortcut id : {c.shortcut_id}")
+                out.append(f"      loops into  : ancestor with id {c.target_id}")
+                out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def format_json(remotes, max_depth, results, errors):
+    return json.dumps({
+        "remotes": remotes,
+        "max_depth": max_depth,
+        "cycles": [
+            {"remote": remote, "path": c.path,
+             "shortcut_id": c.shortcut_id, "target_id": c.target_id}
+            for remote in sorted(results)
+            for c in results[remote][0]
+        ],
+        "errors": {r: e.stderr for r, e in sorted(errors.items())},
+    }, indent=2)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="rclone-cycle-scan",
+        description="Find self-referential Google Drive shortcut cycles that "
+                    "can OOM an rclone mount. Scans the remote, never the mount.")
+    p.add_argument("remotes", nargs="*", default=None,
+                   help=f"rclone remotes to scan (default: {' '.join(DEFAULT_REMOTES)}). "
+                        "May also be a subtree, e.g. 'gdrive-lt:Some/Folder'.")
+    p.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH,
+                   help=f"recursion depth cap (default {DEFAULT_MAX_DEPTH}); only "
+                        "catches cycles whose loop-point is within this depth.")
+    p.add_argument("--rclone-flags", default=DEFAULT_RCLONE_FLAGS,
+                   help="extra flags passed to rclone lsf "
+                        f"(default {DEFAULT_RCLONE_FLAGS!r}).")
+    p.add_argument("--report-file", default=None,
+                   help="also write the text report to this file.")
+    p.add_argument("--json", action="store_true",
+                   help="emit machine-readable JSON to stdout instead of text.")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="suppress per-remote progress on stderr.")
+    args = p.parse_args(argv)
+
+    remotes = args.remotes if args.remotes else list(DEFAULT_REMOTES)
+    rclone_flags = shlex.split(args.rclone_flags)
+
+    results, errors = run_scans(remotes, args.max_depth, rclone_flags,
+                                quiet=args.quiet)
+
+    if args.json:
+        print(format_json(remotes, args.max_depth, results, errors))
+    else:
+        report = format_report(remotes, args.max_depth, results, errors)
+        sys.stdout.write(report)
+        if args.report_file:
+            with open(args.report_file, "w") as f:
+                f.write(report)
+
+    total = sum(len(c) for c, _ in results.values())
+    if errors:
+        return 2
+    return 1 if total > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

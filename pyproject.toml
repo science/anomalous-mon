@@ -1,0 +1,15 @@
+[project]
+name = "anomalous-mon"
+version = "0.0.0"
+description = "System anomaly monitors. Mostly bash; bin/rclone-cycle-scan is Python."
+requires-python = ">=3.10"
+# No runtime dependencies: bin/rclone-cycle-scan is stdlib-only and shells out to
+# the `rclone` binary. This file exists to declare the Python version and the
+# dev/test footprint honestly.
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
