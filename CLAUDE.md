@@ -43,7 +43,7 @@ runcapped -m 8G -s 0 -n bigmatrix python train.py    # 8G cap, no swap, named sc
 
 Defaults: `MemoryMax`=`MemoryHigh`=18G, `MemorySwapMax`=4G (`-m`/`-s` to override; `-s 0` forbids swap so a runaway fails fast instead of thrashing). Runs in the foreground; stdin/stdout/Ctrl-C/exit-code pass through (`exec systemd-run`). A small swap cap is deliberate — it makes a runaway *fail fast* rather than grind the machine through tens of GB of swap first. Full docs: `man runcapped` (source `man/runcapped.1`) or `runcapped --help`.
 
-**Install:** the script lives in the repo (revision-controlled); it's reached on `$PATH` via a symlink `~/.local/bin/runcapped → bin/runcapped`, and `man runcapped` works via `~/.local/share/man/man1/runcapped.1 → man/runcapped.1`. Editing the repo file IS the deploy (same model as the systemd `ExecStart`).
+**Install:** the script lives in the repo (revision-controlled); it's reached on `$PATH` via a symlink `~/.local/bin/runcapped → bin/runcapped`, and `man runcapped` works via `~/.local/share/man/man1/runcapped.1 → man/runcapped.1`. **`install.sh` creates both symlinks** (`ln -sfn`, idempotent) — the repo's installer owns them, matching the brightness-ctl/dev-vm-manager convention, so a fresh `yadm bootstrap` (clone repo + run `install.sh`) gets `runcapped` on `$PATH` for free. Editing the repo file IS the deploy (same model as the systemd `ExecStart`).
 
 ## Deployment model
 

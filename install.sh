@@ -56,7 +56,19 @@ RandomizedDelaySec=2h
 WantedBy=timers.target
 EOF
 
-chmod +x "$SCRIPT_DIR/bin/anomalous-mon"
+chmod +x "$SCRIPT_DIR/bin/anomalous-mon" "$SCRIPT_DIR/bin/runcapped"
+
+# runcapped: the memory-cap companion tool (standalone, not part of the timer
+# loop). Symlink it onto $PATH and its man page into the user man tree, both
+# pointing back at the repo so editing the repo file IS the deploy — same model
+# as the systemd ExecStart above. Mirrors the brightness-ctl/dev-vm-manager
+# convention: the repo's installer owns its own symlinks, so a fresh `yadm
+# bootstrap` (which clones this repo + runs this script) gets runcapped for free.
+BIN_DIR="${HOME}/.local/bin"
+MAN_DIR="${HOME}/.local/share/man/man1"
+mkdir -p "$BIN_DIR" "$MAN_DIR"
+ln -sfn "$SCRIPT_DIR/bin/runcapped" "$BIN_DIR/runcapped"
+ln -sfn "$SCRIPT_DIR/man/runcapped.1" "$MAN_DIR/runcapped.1"
 
 systemctl --user daemon-reload
 systemctl --user enable --now anomalous-mon.timer
@@ -71,3 +83,8 @@ echo "Check status:   systemctl --user status anomalous-mon.timer"
 echo "Stale-files:    systemctl --user list-timers anomalous-mon-stale.timer"
 echo "View logs:      journalctl --user -u anomalous-mon -f"
 echo "Stale report:   anomalous-mon --stale-report  (after first scan completes)"
+echo "Memory cap:     runcapped --help   (symlinked to $BIN_DIR/runcapped)"
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) echo "NOTE: $BIN_DIR is not on your \$PATH — add it to use 'runcapped' directly." ;;
+esac
