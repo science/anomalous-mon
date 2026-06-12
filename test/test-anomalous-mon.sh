@@ -500,8 +500,246 @@ else
     test_result "Disk garbage df line → skipped, no crash" "fail"
 fi
 
+# --- Regression: df exits non-zero (dead fuse mount) → cycle must NOT abort ---
+# Reproduces the 2026-06-12 failure where a dead mount made df exit 1, and the
+# caller's `set -e` aborted the whole monitoring cycle at disk_check (before the
+# memory/stale checks ran). The fix wraps the df|awk pipeline in `{ …; } || true`
+# inside the *real* _disk_sample_cmd, so here we exercise the real sampler with a
+# df mock that prints a healthy mount AND exits 1.
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+unset _DISK_SAMPLE_CMD                     # use the REAL _disk_sample_cmd
+df() { printf 'Mounted Type Use%% Avail\n/ ext4 95%% 2000000\n'; return 1; }
+if disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300; then dc_rc=0; else dc_rc=$?; fi
+unset -f df
+if (( dc_rc == 0 )) && [[ "$ALERT_LOG" == *"disk:/:critical"* ]]; then
+    test_result "Disk df-resilience: df exit 1 (dead mount) → cycle survives, healthy mount still alerts" "pass"
+else
+    test_result "Disk df-resilience: df exit 1 (dead mount) → cycle survives, healthy mount still alerts" "fail"
+fi
+
 # Reset _DISK_SAMPLE_CMD so later tests don't pick it up
 unset _DISK_SAMPLE_CMD
+
+# ── Memory Monitor Tests ──────────────────────────────────────────────
+
+echo ""
+echo "=== Memory Monitor Tests ==="
+echo ""
+
+source "$PROJECT_DIR/lib/memory-monitor.sh"
+
+# Mock the memory sampler. Pass lines verbatim:
+#   "sys <mem_total_kb> <mem_avail_kb> <swap_total_kb> <swap_free_kb> <psi>"
+#   "proc <pid> <rss_kb> <comm>" ...
+set_mock_memory() {
+    _MEM_SAMPLE_CMD="_mock_memory_output"
+    _MOCK_MEM_DATA="$(printf '%s\n' "$@")"
+}
+_mock_memory_output() {
+    [[ -n "${_MOCK_MEM_DATA:-}" ]] && printf '%s\n' "$_MOCK_MEM_DATA"
+}
+
+# A "sys" line with abundant headroom and no PSI stall (keeps Signal A quiet
+# during Signal-B growth tests). 20 GB RAM free + 30 GB swap free.
+MEM_HEALTHY_SYS="sys 33554432 20971520 33554432 31457280 0"
+
+reset_mem_state() {
+    reset_test_state
+    unset _MEM_SAMPLE_CMD _MOCK_MEM_DATA _MEM_NOW MEM_GROWTH_OVERRIDES
+    rm -f "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    MEM_GROWTH_FLOOR_MB=1024
+    MEM_GROWTH_TICK_MB=150
+    MEM_GROWTH_CYCLES=5
+    MEM_MIN_HEADROOM_MB=2048
+    MEM_PSI_FULL_PCT=20
+    MEM_PRESSURE_COOLDOWN=300
+}
+
+# --- Large process with flat RSS → no runaway alert ---
+reset_mem_state
+for i in {1..6}; do
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 1500000 python"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+done
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: large but flat process → no runaway alert" "pass"
+else
+    test_result "Memory: large but flat process → no runaway alert" "fail"
+fi
+
+# --- Large process growing each cycle → runaway alert after CYCLES ---
+reset_mem_state
+rss=1100000
+for i in {1..6}; do
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 ${rss} python"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    rss=$(( rss + 200000 ))   # +~195 MB/cycle, above the 150 MB tick gate
+done
+if [[ "$ALERT_LOG" == *"mem:runaway:2000"* ]] && [[ "$ALERT_LOG" == *"python"* ]]; then
+    test_result "Memory: large process growing 5 cycles → runaway alert fires" "pass"
+else
+    test_result "Memory: large process growing 5 cycles → runaway alert fires" "fail"
+fi
+
+# --- Runaway alert carries process name as dedup group ---
+reset_mem_state
+rss=1100000
+for i in {1..6}; do
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 ${rss} python"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    rss=$(( rss + 200000 ))
+done
+if echo -e "$ALERT_LOG" | grep -qE '^mem\|mem:runaway:2000\|.*\|mem:runaway:python$'; then
+    test_result "Memory: runaway alert passes process name as dedup group" "pass"
+else
+    test_result "Memory: runaway alert passes process name as dedup group" "fail"
+fi
+
+# --- Small process growing fast → no alert (below floor) ---
+reset_mem_state
+rss=100000          # ~100 MB, well under the 1 GB floor
+for i in {1..6}; do
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 3000 ${rss} leaker"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    rss=$(( rss + 160000 ))   # grows each cycle but stays < 1 GB
+done
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: small growing process ignored (below floor)" "pass"
+else
+    test_result "Memory: small growing process ignored (below floor)" "fail"
+fi
+
+# --- Growth interrupted before reaching CYCLES → no alert ---
+reset_mem_state
+rss=1100000
+for i in {1..4}; do          # 4 growing cycles (streak reaches 3)
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 ${rss} python"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    rss=$(( rss + 200000 ))
+done
+# One flat cycle resets the streak
+set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 ${rss} python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: interrupted growth streak → no alert" "pass"
+else
+    test_result "Memory: interrupted growth streak → no alert" "fail"
+fi
+
+# --- Per-process override raises the required streak ---
+reset_mem_state
+declare -gA MEM_GROWTH_OVERRIDES=([bigvm]=10)
+rss=1100000
+for i in {1..6}; do          # would alert at 5, but override needs 10
+    set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 ${rss} bigvm"
+    memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+    rss=$(( rss + 200000 ))
+done
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: per-process override delays alert (5 < 10 cycles)" "pass"
+else
+    test_result "Memory: per-process override delays alert (5 < 10 cycles)" "fail"
+fi
+unset MEM_GROWTH_OVERRIDES
+
+# --- System pressure: low combined headroom → pressure alert ---
+reset_mem_state
+set_mock_memory "sys 33554432 524288 33554432 524288 0" \
+    "proc 2000 8000000 python" "proc 3000 4000000 chrome"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ "$ALERT_LOG" == *"mem:pressure"* ]] && [[ "$ALERT_LOG" == *"RAM+swap"* ]]; then
+    test_result "Memory: low combined headroom → pressure alert with top consumers" "pass"
+else
+    test_result "Memory: low combined headroom → pressure alert with top consumers" "fail"
+fi
+
+# --- System pressure: high PSI stall fires even with headroom ---
+reset_mem_state
+set_mock_memory "sys 33554432 20971520 33554432 31457280 55" "proc 2000 8000000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ "$ALERT_LOG" == *"mem:pressure"* ]] && [[ "$ALERT_LOG" == *"stalling"* ]]; then
+    test_result "Memory: high PSI stall → pressure alert despite free headroom" "pass"
+else
+    test_result "Memory: high PSI stall → pressure alert despite free headroom" "fail"
+fi
+
+# --- Healthy system → no pressure alert ---
+reset_mem_state
+set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 8000000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: healthy system → no pressure alert" "pass"
+else
+    test_result "Memory: healthy system → no pressure alert" "fail"
+fi
+
+# --- Pressure cooldown: duplicate within cooldown suppressed ---
+reset_mem_state
+set_mock_memory "sys 33554432 524288 33554432 524288 0" "proc 2000 8000000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+first_mem="$ALERT_LOG"
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ -n "$first_mem" && -z "$ALERT_LOG" ]]; then
+    test_result "Memory pressure cooldown: duplicate within cooldown suppressed" "pass"
+else
+    test_result "Memory pressure cooldown: duplicate within cooldown suppressed" "fail"
+fi
+
+# --- Pressure cooldown: fires again after cooldown expires ---
+reset_mem_state
+set_mock_memory "sys 33554432 524288 33554432 524288 0" "proc 2000 8000000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+sed -i 's/:[0-9]*$/:1000000000/' "$TEST_TMP/mem.alerts"   # backdate to expire cooldown
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if [[ "$ALERT_LOG" == *"mem:pressure"* ]]; then
+    test_result "Memory pressure cooldown: alert fires again after cooldown expires" "pass"
+else
+    test_result "Memory pressure cooldown: alert fires again after cooldown expires" "fail"
+fi
+
+# --- Corrupt state file tolerated ---
+reset_mem_state
+echo "garbage:::not:valid::data" > "$TEST_TMP/mem.state"
+set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 1500000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts" 2>/dev/null || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: corrupt state file tolerated, no crash" "pass"
+else
+    test_result "Memory: corrupt state file tolerated, no crash" "fail"
+fi
+
+# --- Disappeared PID is pruned from state ---
+reset_mem_state
+set_mock_memory "$MEM_HEALTHY_SYS" "proc 2000 1500000 python"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+# Next tick: process gone
+set_mock_memory "$MEM_HEALTHY_SYS"
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts"
+if ! grep -q 'pid:2000:' "$TEST_TMP/mem.state" 2>/dev/null; then
+    test_result "Memory: disappeared PID pruned from state file" "pass"
+else
+    test_result "Memory: disappeared PID pruned from state file" "fail"
+fi
+
+# --- Empty sample → no crash, no alert ---
+reset_mem_state
+set_mock_memory ""
+memory_check "$TEST_TMP/mem.state" "$TEST_TMP/mem.alerts" 2>/dev/null || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Memory: empty sample → no crash, no alert" "pass"
+else
+    test_result "Memory: empty sample → no crash, no alert" "fail"
+fi
+
+# Reset so later sections don't pick up the mock or config
+unset _MEM_SAMPLE_CMD _MOCK_MEM_DATA _MEM_NOW
+unset MEM_GROWTH_FLOOR_MB MEM_GROWTH_TICK_MB MEM_GROWTH_CYCLES
+unset MEM_MIN_HEADROOM_MB MEM_PSI_FULL_PCT MEM_PRESSURE_COOLDOWN
 
 # ── Journal Monitor Tests ─────────────────────────────────────────────
 
@@ -1350,7 +1588,7 @@ for f in bin lib etc test; do
     fi
 done
 
-for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/stale-files-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
+for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/memory-monitor.sh lib/stale-files-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
     if [[ -f "$PROJECT_DIR/$f" ]]; then
         test_result "File $f exists" "pass"
     else

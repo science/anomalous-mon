@@ -1,0 +1,146 @@
+.TH RUNCAPPED 1 "2026-06-12" "anomalous-mon" "User Commands"
+.SH NAME
+runcapped \- run a command inside a memory-capped systemd user scope
+.SH SYNOPSIS
+.B runcapped
+.RB [ \-m
+.IR MEM ]
+.RB [ \-s
+.IR SWAP ]
+.RB [ \-n
+.IR NAME ]
+.RB [ \-\- ]
+.I command
+.RI [ args... ]
+.br
+.B runcapped
+.RB { \-h | \-\-help }
+.SH DESCRIPTION
+.B runcapped
+launches
+.I command
+inside a transient systemd
+.B \-\-user \-\-scope
+cgroup with hard memory and swap ceilings
+.RB ( MemoryMax ,
+.BR MemoryHigh ,
+.BR MemorySwapMax ).
+If the command's memory use exceeds the cap, the kernel's cgroup OOM killer
+terminates
+.I only that command's cgroup
+\(em not the rest of the desktop session.
+.PP
+This exists because an unconstrained workload that exhausts all RAM
+.I and
+all swap triggers the kernel's
+.I global
+OOM killer, which kills processes across the whole user session by score:
+on 2026-06-12 such a job (a Python data script) took down dbus, gnome-keyring,
+pipewire and Cinnamon, bouncing the user to the login screen. Capping the job
+contains the blast radius. A small
+.B MemorySwapMax
+additionally makes a runaway
+.I fail fast
+instead of thrashing tens of GB of swap (and freezing the desktop) for minutes
+before the OOM finally fires.
+.PP
+The command runs in the foreground attached to the terminal, so stdin/stdout,
+Ctrl\-C, and the exit code behave exactly as if
+.I command
+had been run directly.
+.SH OPTIONS
+.TP
+.BI \-m " MEM"
+Hard memory cap, passed to systemd as
+.BR MemoryMax " and " MemoryHigh .
+Accepts systemd size suffixes (e.g.
+.IR 18G ", " 512M ).
+Default:
+.BR 18G .
+.TP
+.BI \-s " SWAP"
+Swap cap, passed as
+.BR MemorySwapMax .
+Default:
+.BR 4G .
+Use
+.I 0
+to forbid swap entirely (fail as soon as RAM is exhausted).
+.TP
+.BI \-n " NAME"
+Scope unit name suffix. Defaults to the command's basename; for a bare
+interpreter (python, bash, node, ...) the script name (next argument) is used
+instead. Sanitized to
+.BR [A\-Za\-z0\-9_\-] .
+.TP
+.BR \-h ", " \-\-help
+Print the embedded usage block and exit.
+.SH "EXIT STATUS"
+.B runcapped
+.B exec()s
+the command, so its exit status is the command's own. Argument errors (no
+command given, bad option) exit
+.BR 1 .
+If the cgroup OOM killer terminates the command, the shell reports it as a
+signal (typically
+.BR SIGKILL ", 137).
+.SH EXAMPLES
+.PP
+Run a memory-hungry data job under the default 18G/4G caps:
+.PP
+.RS
+.EX
+runcapped python scripts/run_sae_comparison.py --dataset asap_set1_2 \\
+    --device cuda --save-matrices
+.EE
+.RE
+.PP
+Tighter cap, no swap, explicit name:
+.PP
+.RS
+.EX
+runcapped -m 8G -s 0 -n bigmatrix python train.py
+.EE
+.RE
+.PP
+Inspect a running capped job and watch its live memory:
+.PP
+.RS
+.EX
+systemctl --user status 'runcapped-*'
+systemctl --user show -p MemoryCurrent 'runcapped-bigmatrix.scope'
+.EE
+.RE
+.SH NOTES
+.PP
+Requires
+.BR systemd\-run (1)
+with user-session support (cgroup v2 with the memory controller delegated to
+.BR user@.service ,
+the default on modern systemd). There is no fallback: if
+.BR systemd\-run
+is unavailable the
+.B exec
+fails and the command does not run.
+.PP
+The cap protects the desktop from the job; it does
+.I not
+make the job itself succeed. A job that genuinely needs more than the cap will
+be OOM-killed \(em raise
+.B \-m
+or reduce the job's footprint (for example, lower a parallel worker count that
+copies large arrays per worker).
+.SH "SEE ALSO"
+.BR systemd\-run (1),
+.BR systemd.resource\-control (5),
+.BR anomalous\-mon (1)
+.PP
+Companion proactive monitor:
+.B anomalous-mon
+warns on memory pressure and per-process runaway growth
+.I before
+an OOM. See
+.I PLAN-memory-monitor.md
+and
+.I FINDINGS-rclone-oom-2026-06-09.md
+in the anomalous-mon repository.

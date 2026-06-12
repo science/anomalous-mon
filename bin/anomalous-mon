@@ -25,6 +25,7 @@ source "$PROJECT_DIR/lib/notify.sh"
 source "$PROJECT_DIR/lib/cpu-monitor.sh"
 source "$PROJECT_DIR/lib/journal-monitor.sh"
 source "$PROJECT_DIR/lib/disk-monitor.sh"
+source "$PROJECT_DIR/lib/memory-monitor.sh"
 source "$PROJECT_DIR/lib/stale-files-monitor.sh"
 
 # Runtime state files
@@ -33,6 +34,8 @@ CPU_STATE_FILE="${STATE_DIR}/anomalous-mon.state"
 JOURNAL_CURSOR_FILE="${STATE_DIR}/anomalous-mon.cursor"
 JOURNAL_ALERT_FILE="${STATE_DIR}/anomalous-mon.oom-alerts"
 DISK_ALERT_FILE="${STATE_DIR}/anomalous-mon.disk-alerts"
+MEM_STATE_FILE="${STATE_DIR}/anomalous-mon.mem-state"
+MEM_ALERT_FILE="${STATE_DIR}/anomalous-mon.mem-alerts"
 NOTIFY_ID_FILE="${STATE_DIR}/anomalous-mon.notify-ids"
 STALE_REPORT_FILE="${STATE_DIR}/anomalous-mon.stale-report"
 STALE_LAST_SCAN_FILE="${STATE_DIR}/anomalous-mon.stale-last-scan"
@@ -54,6 +57,8 @@ case "${1:-}" in
         fi
         echo ""
         disk_status "$DISK_ALERT_FILE" "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB"
+        echo ""
+        memory_status "$MEM_STATE_FILE"
         echo ""
         stale_files_status "$STALE_REPORT_FILE" "$STALE_LAST_SCAN_FILE" "$STALE_ACK_FILE"
         exit 0
@@ -100,6 +105,7 @@ journal_check "$JOURNAL_CURSOR_FILE" "$OOM_LOOKBACK" "$JOURNAL_ALERT_FILE" "$OOM
 disk_check "$DISK_ALERT_FILE" \
     "$DISK_WARN_PCT" "$DISK_CRIT_PCT" "$DISK_MIN_FREE_GB" \
     "$DISK_WARN_COOLDOWN" "$DISK_CRIT_COOLDOWN"
+memory_check "$MEM_STATE_FILE" "$MEM_ALERT_FILE"
 
 # Log tracking state if anything is being tracked
 _load_state "$CPU_STATE_FILE"

@@ -23,11 +23,13 @@
 #
 # _NPROC can be set to override nproc for testing.
 
-# Default: sample real processes via pidstat (60-second interval)
+# Default: sample real processes via pidstat (60-second interval).
+# _CPU_SAMPLE_INTERVAL overrides the interval (used by the live smoke test to
+# avoid a 60s wait); production leaves it at the 60s default.
 _cpu_sample_cmd() {
     # pidstat output: timestamp UID PID %usr %system %guest %wait %CPU CPU Command
     # We want: PID %CPU COMM ARGS
-    pidstat -l 60 1 2>/dev/null \
+    pidstat -l "${_CPU_SAMPLE_INTERVAL:-60}" 1 2>/dev/null \
         | awk '/^Average:/ { exit } NR>3 && /^[0-9]/ && $9+0 > 0 {
             pid=$4; cpu=$9; cmd=$11
             # Extract bare command name (basename, no path)

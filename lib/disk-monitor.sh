@@ -29,13 +29,20 @@ _DISK_EXCLUDE_FSTYPES="tmpfs devtmpfs squashfs overlay efivarfs fuse.portal fuse
 
 # Default sampler: df, POSIX output, excluding pseudo/virtual/network fstypes.
 # Emits: "<target> <fstype> <pcent_no_%> <avail_kb>" one per real filesystem.
+#
+# df exits non-zero when ANY mount can't be stat'd — e.g. a dead fuse mount
+# ("Transport endpoint is not connected"), common debris after an OOM kills a
+# gvfs/fuse helper. It still prints every HEALTHY mount to stdout first, so we
+# swallow the exit code (|| true): under the caller's `set -e` a flaky df must
+# not abort the whole monitoring cycle (which runs disk_check before the other
+# monitors). Stderr is dropped; the healthy mounts still flow through.
 _disk_sample_cmd() {
-    df --output=target,fstype,pcent,avail \
+    { df --output=target,fstype,pcent,avail \
         -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs \
         -x fuse.portal -x fuse.rclone -x fuse.snapfuse \
         -x autofs -x nfs -x nfs4 -x cifs -x smbfs -x virtiofs \
         2>/dev/null \
-      | awk 'NR>1 { gsub(/%/,"",$3); print $1, $2, $3, $4 }'
+      | awk 'NR>1 { gsub(/%/,"",$3); print $1, $2, $3, $4 }'; } || true
 }
 
 # Load disk alert state into _DISK_ALERTED (key → epoch).

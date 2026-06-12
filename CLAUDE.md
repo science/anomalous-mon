@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O redirected to `$(mktemp -d)`).
+- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 103 checks.
+- **Run the live tests:** `./test/test-live.sh` (opt-in; also gated by `ANOMALOUS_MON_LIVE_TESTS=1`). Exercises the **real** samplers (pidstat/df/`/proc`/journalctl/find) plus true end-to-end: spawns a real growing process and asserts a `mem:runaway` alert fires through the real `/proc` sampler (and reads the message back), and runs a real OOM inside a `runcapped` scope to confirm containment. Needs `pidstat`, user `systemd-run`, `python3`, a journal; briefly allocates a few hundred MB. This is the layer the mocked suite can't cover.
 - **Run a single test:** there's no test selector. The suite is a single bash file with inline assertions; comment out sections you don't want to run, or copy the `reset_test_state` + assertion block into a scratch script that sources the libs.
 - **Run one monitoring cycle manually:** `bin/anomalous-mon` (with no args). This is what the systemd timer invokes — safe to run ad-hoc.
 - **Inspect current tracking state:** `bin/anomalous-mon --status`.
@@ -14,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Print the latest stale-files report:** `bin/anomalous-mon --stale-report`.
 - **Silence a file the stale-scan keeps flagging:** `bin/anomalous-mon --ack /path/to/file` (or `--unack` to reverse).
 - **Hunt an rclone shortcut-cycle (after a gdrive OOM alert):** `bin/rclone-cycle-scan` — scans `gdrive-lt:` + `gdrive-personal:` for self-referential Drive shortcuts that loop forever and OOM the mount; names the exact shortcut to move. See "Standalone tool" below.
+- **Run a heavy job memory-capped (so an OOM can't take down the desktop):** `runcapped <command…>` (or `bin/runcapped`). Wraps the command in a memory-limited systemd user scope. See "Standalone tool: `bin/runcapped`" below.
 - **Run the Python tests:** `pytest test/test_rclone_cycle_scan.py` (only the `rclone-cycle-scan` logic; everything else is bash).
 
 There is no build step, no linter, no lockfile. Mostly bash + coreutils + sysstat (`pidstat`) + systemd + `notify-send`. The one exception is `bin/rclone-cycle-scan` (Python 3 stdlib only; shells out to `rclone`).
@@ -29,6 +31,19 @@ bin/rclone-cycle-scan "gdrive-lt:Some/Subtree"   # scan one subtree deeper
 ```
 
 Runs the two remotes in **parallel** (different Google accounts → independent API quotas; ~9 min wall-clock for both). Exit codes: `0` clean, `1` cycles found, `2` a scan failed. Detection logic (`detect_cycles`) is pure and unit-tested in `test/test_rclone_cycle_scan.py`. Full background + the incident that motivated it: `FINDINGS-rclone-oom-2026-06-09.md` and `PLAN-cycle-monitor.md` (which records *why* this is on-demand rather than a weekly timer). It does **not** auto-fix — you move/remove the shortcut in the Drive UI.
+
+## Standalone tool: `bin/runcapped`
+
+Also **not** part of the 5 s loop — the *mitigation* companion to the memory monitor. The monitor (`lib/memory-monitor.sh`) *warns*; `runcapped` *contains*. Wrap any heavy job in a memory-capped systemd `--user --scope` so that if it runs away, the kernel's **cgroup** OOM killer terminates only that job's cgroup — not the desktop session. (The 2026-06-12 incident was a *global* OOM that killed dbus/keyring/pipewire/Cinnamon precisely because the job was unconstrained.)
+
+```
+runcapped python scripts/run_sae_comparison.py --dataset asap_set1_2 --device cuda --save-matrices
+runcapped -m 8G -s 0 -n bigmatrix python train.py    # 8G cap, no swap, named scope
+```
+
+Defaults: `MemoryMax`=`MemoryHigh`=18G, `MemorySwapMax`=4G (`-m`/`-s` to override; `-s 0` forbids swap so a runaway fails fast instead of thrashing). Runs in the foreground; stdin/stdout/Ctrl-C/exit-code pass through (`exec systemd-run`). A small swap cap is deliberate — it makes a runaway *fail fast* rather than grind the machine through tens of GB of swap first. Full docs: `man runcapped` (source `man/runcapped.1`) or `runcapped --help`.
+
+**Install:** the script lives in the repo (revision-controlled); it's reached on `$PATH` via a symlink `~/.local/bin/runcapped → bin/runcapped`, and `man runcapped` works via `~/.local/share/man/man1/runcapped.1 → man/runcapped.1`. Editing the repo file IS the deploy (same model as the systemd `ExecStart`).
 
 ## Deployment model
 
@@ -87,6 +102,19 @@ Two severities per mount, computed fresh each tick from `df --output=target,fsty
 
 **Float comparisons.** Bash `(( ))` can't compare floats, and `MIN_FREE_GB` can be fractional (e.g. `0.1` for `/boot`). `_disk_lt` and `_disk_kb_to_gb` shell out to `awk` for the float work; the integer comparisons (pcent vs. warn/crit) stay in native bash.
 
+**`df` exit-code resilience (load-bearing).** `df` exits **non-zero** when *any* mount can't be stat'd — a dead fuse mount (`Transport endpoint is not connected`) is common debris after an OOM kills a gvfs/fuse helper. `df` still prints every healthy mount to stdout, so `_disk_sample_cmd` wraps the `df | awk` pipeline in `{ …; } || true`. Without this, the caller's `set -e` turns one flaky mount into an aborted *entire* monitoring cycle — and since `disk_check` runs **before** the memory/stale checks, a single dead mount silently took the whole monitor down every tick. (This is exactly what happened post-incident on 2026-06-12.)
+
+### Memory monitoring (`lib/memory-monitor.sh`)
+
+Proactive — fires *before* the kernel OOM killer, unlike the journal OOM detector which is post-mortem. Motivated by the 2026-06-12 global-OOM incident (`PLAN-memory-monitor.md`): an unconstrained Python job exhausted RAM+swap and the global OOM killer tore the desktop session apart. `memory_check` does everything in one pass (no separate sample/check split like CPU) and fires on **two independent criteria**:
+
+- **Signal A — system-wide pressure** (threshold + cooldown, like disk). Fires when combined free headroom `MemAvailable + SwapFree` drops below `MEM_MIN_HEADROOM_MB`, **OR** memory PSI `full` avg60 ≥ `MEM_PSI_FULL_PCT` (the kernel is *stalling* on memory — the earliest "thrashing/freeze" signal). Body lists the top-3 RSS consumers. Group `mem:pressure`; cooldown `MEM_PRESSURE_COOLDOWN`. **Guarded on `sys_total > 0`** so an empty/garbage sample (zeros) doesn't read as "zero headroom" and false-alarm.
+- **Signal B — per-process runaway growth** (consecutive-cycle streak, reusing cpu-monitor's state-machine shape). A process alerts only when it is **both** large (`RSS ≥ MEM_GROWTH_FLOOR_MB`, ~1 GB — anything smaller is ignored) **and** has grown by `≥ MEM_GROWTH_TICK_MB` for `MEM_GROWTH_CYCLES` consecutive ~1-minute cycles. This is deliberately **not a raw slope**: a tiny driver creeping bytes/year is below the floor *and* below the per-cycle delta, so it never qualifies; a sawtooth/GC process breaks its streak each dip. The streak resets (and clears the alert) the moment growth stalls. Per-process overrides via `MEM_GROWTH_OVERRIDES` (comm → cycles) let known legitimate growers (browsers, ballooning VMs) need a longer streak. Group `mem:runaway:<name>`.
+
+**Sampling** (`_memory_sample_cmd`, overridable via `_MEM_SAMPLE_CMD`; `set_mock_memory` in tests). Emits one `sys <mem_total_kb> <mem_avail_kb> <swap_total_kb> <swap_free_kb> <psi_full_avg60>` line (from `/proc/meminfo` + `/proc/pressure/memory`) followed by `proc <pid> <rss_kb> <comm>` lines (one awk pass over `/proc/[0-9]*/status`; kernel threads with no `VmRSS` are skipped). The per-PID trend state tracks *every* process so growth can be measured from first sighting; PID reuse just resets the streak (new tiny RSS < prev + tick). `_MEM_NOW` overrides the clock for cooldown tests.
+
+**The mitigation companion is `bin/runcapped`** — wrap a heavy job in a memory-capped systemd scope so an OOM kills only the job, not the desktop. See "Standalone tool" below. The monitor *warns*; `runcapped` *contains*.
+
 ### Stale large-files monitor (`lib/stale-files-monitor.sh`)
 
 A **separate weekly timer** (`anomalous-mon-stale.{service,timer}`, `OnCalendar=Mon 03:00` with `RandomizedDelaySec=2h`, `Persistent=true`). Not invoked from the 5s loop — a filesystem walk every 5s would be absurd. The main binary's `--stale-scan` flag is the service entrypoint.
@@ -126,7 +154,11 @@ The libs are designed to be sourced and mocked:
 - `_DISK_SAMPLE_CMD` — override `_disk_sample_cmd` with a function returning fake `target fstype pcent avail_kb` lines (one per mount). `set_mock_disk "..."` is the convenience helper.
 - `_STALE_FILES_SCAN_CMD` — override `_stale_files_scan_cmd` with a function returning fake `size_bytes<TAB>mtime_epoch<TAB>path` lines. `set_mock_stale "..."` is the convenience helper.
 - `_STALE_FINDMNT_CMD` — override `_stale_findmnt_cmd` for mount-prune testing. Emits `target<SPACE>fstype` lines. `set_mock_findmnt "..."` is the convenience helper.
+- `_MEM_SAMPLE_CMD` — override `_memory_sample_cmd` with a function returning a fake `sys …` line + `proc <pid> <rss_kb> <comm>` lines. `set_mock_memory "..."` is the convenience helper. `_MEM_NOW` overrides the clock for pressure-cooldown tests.
 - `_NPROC` — override `nproc` for deterministic total-CPU threshold math (fixed to 4 in tests).
+- `_CPU_SAMPLE_INTERVAL` — overrides the `pidstat` interval (default 60s) so the live smoke test can sample in ~2s instead of waiting a full minute. Not used by the mocked suite.
+
+**The mocked suite cannot test the default samplers themselves** (the real pidstat/df/`/proc`/journalctl/find parsing) or true end-to-end alerting — those replace points are exactly what's mocked. `test/test-live.sh` is the opt-in complement that runs the real samplers and drives a real runaway process + real `runcapped` OOM, asserting on the actual alert text. Add coverage for new *logic* to `test-anomalous-mon.sh`; add coverage for new *real-I/O parsing or e2e behavior* to `test-live.sh`.
 
 There are two flavors of `send_alert` in the test file:
 1. A **mock wrapper** (default) that captures calls to `ALERT_LOG` in `type|key|message|group\n` format. This is what most tests assert against.
@@ -142,6 +174,8 @@ All under `${XDG_RUNTIME_DIR:-/tmp}`:
 | `anomalous-mon.cursor` | last journalctl cursor | single line, opaque cursor token |
 | `anomalous-mon.oom-alerts` | OOM cooldown state | `<key>:<epoch>` per line |
 | `anomalous-mon.disk-alerts` | Disk WARN/CRITICAL cooldown state | `disk:<mount>:<severity>:<epoch>` per line; `<severity>` is `warn` or `critical`. Parsed with `${line%:*}` / `${line##*:}` so a key with embedded colons like `disk:/:warn` still splits correctly. |
+| `anomalous-mon.mem-state` | Memory: per-PID runaway-growth trend (Signal B) | `pid:<PID>:<NAME>:<LAST_RSS_KB>:<STREAK>:<ALERTED>` per line |
+| `anomalous-mon.mem-alerts` | Memory: system-pressure cooldown (Signal A) | `mem:pressure:<epoch>` per line (parsed like `disk-alerts`) |
 | `anomalous-mon.notify-ids` | group → notify-send id | `<group>\t<id>` per line |
 | `anomalous-mon.stale-report` | Stale-files: latest human-readable report | header + sorted SIZE/AGE/PATH table; regenerated each scan |
 | `anomalous-mon.stale-last-scan` | Stale-files: timestamp of last scan | single epoch |

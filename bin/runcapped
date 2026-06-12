@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# runcapped — launch a command inside a memory-capped systemd user scope.
+#
+# Motivation: on 2026-06-12 an unconstrained Python data job
+# (run_sae_comparison.py, --save-matrices + 8-way joblib CI bootstrap)
+# grew past 31 GB RAM + 32 GB swap. The kernel's *global* OOM killer then
+# tore the desktop session apart (dbus, gnome-keyring, pipewire, the tmux
+# vte-spawn scopes, Cinnamon) and bounced the user to the login screen.
+# See PLAN-memory-monitor.md for the full incident write-up.
+#
+# Running the job inside a cgroup with MemoryMax + MemorySwapMax means an
+# OOM is contained to the job's own cgroup: the kernel kills the job, not
+# the desktop. A small MemorySwapMax also makes a runaway *fail fast*
+# instead of thrashing 32 GB of swap (load average hit 20 during the
+# incident) for minutes first.
+#
+# Usage:
+#   runcapped [-m MEM] [-s SWAP] [-n NAME] -- <command> [args...]
+#   runcapped python scripts/run_sae_comparison.py --dataset asap_set1_2 ...
+#
+# Options:
+#   -m MEM    Hard memory cap (MemoryMax).  Default: 18G
+#   -s SWAP   Swap cap (MemorySwapMax).     Default: 4G
+#   -n NAME   Scope unit name suffix.       Default: derived from the command
+#   -h        Show this help.
+#
+# The `--` is optional; the first non-option token begins the command.
+# Runs in the foreground attached to your terminal (--scope), so stdin/stdout,
+# Ctrl-C, and exit code all behave as if you had run the command directly.
+#
+# Inspect a running capped job:   systemctl --user status 'runcapped-*'
+# Watch its memory live:          systemctl --user show -p MemoryCurrent 'runcapped-<name>.scope'
+
+set -euo pipefail
+
+MEM_MAX="18G"
+SWAP_MAX="4G"
+NAME=""
+
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# Long-form --help (getopts only does single-char flags). Checked before
+# getopts so it works even as the very first token.
+[[ "${1:-}" == "--help" ]] && usage 0
+
+while getopts ":m:s:n:h" opt; do
+    case "$opt" in
+        m) MEM_MAX="$OPTARG" ;;
+        s) SWAP_MAX="$OPTARG" ;;
+        n) NAME="$OPTARG" ;;
+        h) usage 0 ;;
+        \?) echo "runcapped: unknown option -$OPTARG" >&2; usage 1 ;;
+        :)  echo "runcapped: option -$OPTARG requires an argument" >&2; usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Allow an explicit `--` separator before the command.
+[[ "${1:-}" == "--" ]] && shift
+
+if [[ $# -eq 0 ]]; then
+    echo "runcapped: no command given" >&2
+    usage 1
+fi
+
+# Derive a scope name from the command basename if not supplied. systemd unit
+# names allow a limited charset; sanitize to [A-Za-z0-9_-].
+if [[ -z "$NAME" ]]; then
+    NAME="$(basename -- "$1")"
+    # If the program is a generic interpreter, prefer the script name (arg 2).
+    case "$NAME" in
+        python|python3|bash|sh|node|ruby|perl)
+            [[ -n "${2:-}" ]] && NAME="$(basename -- "$2")" ;;
+    esac
+fi
+NAME="${NAME//[^A-Za-z0-9_-]/_}"
+# systemd appends its own uniqueness, but include the PID for human readability.
+UNIT="runcapped-${NAME}-$$"
+
+echo "runcapped: MemoryMax=${MEM_MAX} MemorySwapMax=${SWAP_MAX} unit=${UNIT}.scope" >&2
+echo "runcapped: an OOM inside this scope kills the job only — not your desktop." >&2
+
+# MemoryHigh (soft throttle) is set to the same ceiling as MemoryMax: as the
+# cgroup approaches it the kernel aggressively reclaims and stalls the job's
+# allocations (throttle) rather than letting it slam straight into the hard
+# OOM, which often lets a job free a buffer / finish a GC instead of dying.
+exec systemd-run --user --scope --quiet \
+    --unit="$UNIT" \
+    -p MemoryMax="$MEM_MAX" \
+    -p MemoryHigh="$MEM_MAX" \
+    -p MemorySwapMax="$SWAP_MAX" \
+    -- "$@"
