@@ -20,6 +20,13 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Load configuration
 source "$PROJECT_DIR/etc/anomalous-mon.conf"
 
+# Optional per-host overrides (gitignored; absent on most hosts). Sourced AFTER
+# the tracked conf so a host can tune thresholds — e.g. merge an extra entry
+# into CPU_SUSTAINED_OVERRIDES — without dirtying the clone. Merge into existing
+# arrays (CPU_SUSTAINED_OVERRIDES[foo]=N); do not re-`declare -A` them.
+[[ -f "$PROJECT_DIR/etc/anomalous-mon.conf.local" ]] \
+    && source "$PROJECT_DIR/etc/anomalous-mon.conf.local"
+
 # Load libraries
 source "$PROJECT_DIR/lib/notify.sh"
 source "$PROJECT_DIR/lib/cpu-monitor.sh"

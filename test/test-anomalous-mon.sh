@@ -1555,6 +1555,36 @@ else
     test_result "Config file loads with correct defaults" "fail"
 fi
 
+# --- Per-host .conf.local override layer ---
+# bin/anomalous-mon must source an optional etc/anomalous-mon.conf.local AFTER
+# the tracked conf, so a host can tune thresholds without dirtying the clone.
+# (Structural) the binary wires the conditional source:
+if grep -qE 'anomalous-mon\.conf\.local' "$PROJECT_DIR/bin/anomalous-mon"; then
+    test_result ".conf.local: bin sources optional per-host override file" "pass"
+else
+    test_result ".conf.local: bin sources optional per-host override file" "fail"
+fi
+
+# (Semantics) a .conf.local sourced after the tracked conf merges INTO
+# CPU_SUSTAINED_OVERRIDES (no re-declare) — it adds a key without clobbering the
+# tracked entries, and _get_sustained_cycles picks it up. Guards the documented
+# "don't re-declare -A" gotcha.
+reset_test_state
+unset CPU_SUSTAINED_OVERRIDES 2>/dev/null || true
+source "$PROJECT_DIR/etc/anomalous-mon.conf"          # declares the array (firefox=120, …)
+before="$(_get_sustained_cycles python3 5)"           # python3 not tracked → default
+conf_local="$TEST_TMP/anomalous-mon.conf.local"
+printf '%s\n' 'CPU_SUSTAINED_OVERRIDES[python3]=30' > "$conf_local"
+source "$conf_local"                                  # mimics bin's conditional source
+after="$(_get_sustained_cycles python3 5)"
+firefox="$(_get_sustained_cycles firefox 5)"
+if [[ "$before" == "5" && "$after" == "30" && "$firefox" == "120" ]]; then
+    test_result ".conf.local: merges python3→30 without clobbering tracked firefox→120" "pass"
+else
+    test_result ".conf.local: merges python3→30 without clobbering tracked firefox→120" "fail"
+fi
+unset CPU_SUSTAINED_OVERRIDES
+
 # --- Full cycle: sample → detect → alert → clear ---
 reset_test_state
 set_mock_ps "7777 90.0 runaway"

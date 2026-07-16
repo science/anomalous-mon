@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Per-host config overrides — never travel via git (like secrets)
+etc/*.conf.local
