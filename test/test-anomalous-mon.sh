@@ -736,6 +736,44 @@ else
     test_result "Memory: empty sample → no crash, no alert" "fail"
 fi
 
+# --- Regression: /proc entry vanishing mid-sample → cycle must NOT abort ---
+# Reproduces the 2026-07-15..20 t480 status=2 blips: a process exits between
+# the shell expanding /proc/[0-9]*/status and awk opening that file; mawk/gawk
+# treat an unopenable command-line file as FATAL and exit 2, and without the
+# sampler's `|| true` the caller's `set -e` killed the whole monitoring cycle
+# — silently, since the awk's stderr goes to /dev/null. Exercise the REAL
+# sampler against a fake proc root whose last status file is unreadable
+# (same failure mode as ENOENT).
+reset_mem_state
+unset _MEM_SAMPLE_CMD                      # use the REAL _memory_sample_cmd
+fakeproc="$TEST_TMP/fakeproc"
+rm -rf "$fakeproc"; mkdir -p "$fakeproc/100" "$fakeproc/200" "$fakeproc/300"
+printf 'Name:\tpython\nVmRSS:\t1500000 kB\n' > "$fakeproc/100/status"
+printf 'Name:\tpending\nVmRSS:\t2000 kB\n'   > "$fakeproc/200/status"
+printf 'Name:\tghost\nVmRSS:\t1000 kB\n'     > "$fakeproc/300/status"
+chmod 000 "$fakeproc/300/status"           # unopenable → awk fatal (exit 2)
+if out="$(_MEM_PROC_ROOT="$fakeproc" _memory_sample_cmd)"; then ms_rc=0; else ms_rc=$?; fi
+if (( ms_rc == 0 )) && [[ "$out" == *"proc 100 1500000 python"* ]]; then
+    test_result "Memory sampler resilience: unopenable /proc status → sampler exits 0, earlier procs still emitted" "pass"
+else
+    test_result "Memory sampler resilience: unopenable /proc status → sampler exits 0, earlier procs still emitted" "fail"
+fi
+# The e2e propagation check must cross a real process boundary: calling
+# memory_check inside an `if` here would put its whole body in a
+# set-e-ignored context and the test could never go red.
+mc_rc=0
+bash -c "set -euo pipefail
+    source '$PROJECT_DIR/lib/notify.sh'
+    source '$PROJECT_DIR/lib/memory-monitor.sh'
+    _MEM_PROC_ROOT='$fakeproc' memory_check '$TEST_TMP/mem.state' '$TEST_TMP/mem.alerts'
+" >/dev/null 2>&1 || mc_rc=$?
+chmod 644 "$fakeproc/300/status"
+if (( mc_rc == 0 )); then
+    test_result "Memory sampler resilience: unopenable /proc status → memory_check cycle survives" "pass"
+else
+    test_result "Memory sampler resilience: unopenable /proc status → memory_check cycle survives" "fail"
+fi
+
 # Reset so later sections don't pick up the mock or config
 unset _MEM_SAMPLE_CMD _MOCK_MEM_DATA _MEM_NOW
 unset MEM_GROWTH_FLOOR_MB MEM_GROWTH_TICK_MB MEM_GROWTH_CYCLES

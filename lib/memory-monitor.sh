@@ -72,6 +72,14 @@ _memory_sample_cmd() {
 
     # One pass over /proc/*/status emitting "proc <pid> <rss_kb> <comm>".
     # Kernel threads (no mm) have no VmRSS and are skipped.
+    #
+    # `|| true` is load-bearing (same class as _disk_sample_cmd's df guard): a
+    # process can exit between the shell expanding the glob and awk opening
+    # that file; mawk/gawk treat an unopenable command-line file as FATAL and
+    # exit 2, killing the whole cycle under the caller's `set -e` — with the
+    # error text already swallowed by the 2>/dev/null. awk aborts at the bad
+    # file, so the tail of the proc list is lost for one tick; that only
+    # resets those PIDs' growth streaks, which self-heals next tick.
     awk '
         function flush() {
             if (pid != "" && rss != "") print "proc", pid, rss, name
@@ -81,7 +89,7 @@ _memory_sample_cmd() {
         /^Name:/  { name = $2 }
         /^VmRSS:/ { rss = $2 }
         END { flush() }
-    ' /proc/[0-9]*/status 2>/dev/null
+    ' "${_MEM_PROC_ROOT:-/proc}"/[0-9]*/status 2>/dev/null || true
 }
 
 # ── State I/O (Signal B per-PID trend) ────────────────────────────────
