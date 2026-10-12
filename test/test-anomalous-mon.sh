@@ -1647,6 +1647,187 @@ else
     test_result "Full cycle: sample → detect → alert → clear → re-alert" "fail"
 fi
 
+# ── Battery Monitor Tests ─────────────────────────────────────────────
+
+echo ""
+echo "=== Battery Monitor Tests ==="
+echo ""
+
+source "$PROJECT_DIR/lib/battery-monitor.sh" || true
+
+# Mock sample. Format per line: name capacity status ac_online end_threshold
+set_mock_battery() {
+    _BATTERY_SAMPLE_CMD="_mock_battery_output"
+    _MOCK_BATTERY_DATA="$*"
+}
+# Runs inside $( ), so record the call in a file — a variable would not
+# survive the subshell.
+_mock_battery_output() {
+    touch "$TEST_TMP/bat.sampled"
+    printf '%b\n' "$_MOCK_BATTERY_DATA"
+}
+bat_reset() {
+    reset_test_state
+    rm -f "$TEST_TMP/bat.alerts" "$TEST_TMP/bat.sampled"
+    unset _BATTERY_NOW
+}
+
+# --- All checks disabled (the default) → never samples, never alerts ---
+bat_reset
+set_mock_battery "BAT0 5 Discharging 0 100"
+battery_check "$TEST_TMP/bat.alerts" "" "" "" 1800 || true
+if [[ -z "$ALERT_LOG" && ! -e "$TEST_TMP/bat.sampled" ]]; then
+    test_result "Battery: all checks disabled → no sample, no alert" "pass"
+else
+    test_result "Battery: all checks disabled → no sample, no alert" "fail"
+fi
+
+# --- Below LOW on battery power → low alert naming the outage ---
+bat_reset
+set_mock_battery "BAT1 58 Discharging 0 70"
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+if [[ "$ALERT_LOG" == *"battery|battery:BAT1:low|"*"58%"*"AC offline"*"|battery:BAT1"* ]]; then
+    test_result "Battery: below LOW on battery → low alert (AC offline)" "pass"
+else
+    test_result "Battery: below LOW on battery → low alert (AC offline)" "fail"
+fi
+
+# --- Below LOW with AC online → low alert naming the charging fault ---
+bat_reset
+set_mock_battery "BAT1 58 Not_charging 1 70"
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+if [[ "$ALERT_LOG" == *"battery:BAT1:low|"*"AC online"* ]]; then
+    test_result "Battery: below LOW on AC → low alert (AC online, not charging)" "pass"
+else
+    test_result "Battery: below LOW on AC → low alert (AC online, not charging)" "fail"
+fi
+
+# --- Exactly at LOW → no alert (strictly below) ---
+bat_reset
+set_mock_battery "BAT1 60 Discharging 0 70"
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Battery: exactly at LOW → no alert" "pass"
+else
+    test_result "Battery: exactly at LOW → no alert" "fail"
+fi
+
+# --- Above HIGH → high alert ---
+bat_reset
+set_mock_battery "BAT0 80 Charging 1 70"
+battery_check "$TEST_TMP/bat.alerts" 60 75 "" 1800 || true
+if [[ "$ALERT_LOG" == *"battery:BAT0:high|"*"80%"* && "$ALERT_LOG" != *":low|"* ]]; then
+    test_result "Battery: above HIGH → high alert" "pass"
+else
+    test_result "Battery: above HIGH → high alert" "fail"
+fi
+
+# --- HIGH disabled, LOW enabled, pack full → no alert (pre-drain state) ---
+bat_reset
+set_mock_battery "BAT0 100 Full 1 70\nBAT1 98 Not_charging 1 70"
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+if [[ -z "$ALERT_LOG" && -e "$TEST_TMP/bat.sampled" ]]; then
+    test_result "Battery: HIGH disabled → full packs do not alert" "pass"
+else
+    test_result "Battery: HIGH disabled → full packs do not alert" "fail"
+fi
+
+# --- Charge-stop threshold drifted from expected → threshold alert ---
+bat_reset
+set_mock_battery "BAT0 69 Not_charging 1 100"
+battery_check "$TEST_TMP/bat.alerts" "" "" 70 1800 || true
+if [[ "$ALERT_LOG" == *"battery:BAT0:threshold|"*"100"*"70"* ]]; then
+    test_result "Battery: charge-stop threshold drift → threshold alert" "pass"
+else
+    test_result "Battery: charge-stop threshold drift → threshold alert" "fail"
+fi
+
+# --- Pack without threshold support ("-") → no threshold alert ---
+bat_reset
+set_mock_battery "BAT0 69 Not_charging 1 -"
+battery_check "$TEST_TMP/bat.alerts" "" "" 70 1800 || true
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "Battery: no threshold support → no threshold alert" "pass"
+else
+    test_result "Battery: no threshold support → no threshold alert" "fail"
+fi
+
+# --- Packs are independent: only the low one alerts ---
+bat_reset
+set_mock_battery "BAT0 69 Not_charging 0 70\nBAT1 30 Discharging 0 70"
+battery_check "$TEST_TMP/bat.alerts" 60 75 70 1800 || true
+if [[ "$ALERT_LOG" == *"battery:BAT1:low"* && "$ALERT_LOG" != *"BAT0"* ]]; then
+    test_result "Battery: packs tracked independently" "pass"
+else
+    test_result "Battery: packs tracked independently" "fail"
+fi
+
+# --- Cooldown: back-to-back → one alert; after expiry → fires again ---
+bat_reset
+set_mock_battery "BAT1 58 Discharging 0 70"
+_BATTERY_NOW=1000000000
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+first_bat="$ALERT_LOG"
+reset_test_state
+_BATTERY_NOW=1000000600
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+second_bat="$ALERT_LOG"
+reset_test_state
+_BATTERY_NOW=1000002000
+battery_check "$TEST_TMP/bat.alerts" 60 "" "" 1800 || true
+if [[ -n "$first_bat" && -z "$second_bat" && "$ALERT_LOG" == *"battery:BAT1:low"* ]]; then
+    test_result "Battery: cooldown suppresses repeats, re-fires after expiry" "pass"
+else
+    test_result "Battery: cooldown suppresses repeats, re-fires after expiry" "fail"
+fi
+
+# --- Empty or garbage sample → no alert, no crash ---
+bat_reset
+set_mock_battery "garbage\nBAT0 notanumber Full 1 70\n"
+if battery_check "$TEST_TMP/bat.alerts" 60 75 70 1800 && [[ -z "$ALERT_LOG" ]]; then
+    test_result "Battery: garbage sample → no alert, returns 0" "pass"
+else
+    test_result "Battery: garbage sample → no alert, returns 0" "fail"
+fi
+
+# --- Default sampler reads sysfs (fake root) ---
+bat_reset
+unset _BATTERY_SAMPLE_CMD
+_BATTERY_PS_ROOT="$TEST_TMP/ps"
+mkdir -p "$_BATTERY_PS_ROOT"/{AC,BAT0,BAT1,hidpp_battery_0}
+echo Mains > "$_BATTERY_PS_ROOT/AC/type"; echo 1 > "$_BATTERY_PS_ROOT/AC/online"
+for b in BAT0 BAT1; do echo Battery > "$_BATTERY_PS_ROOT/$b/type"; done
+echo 69 > "$_BATTERY_PS_ROOT/BAT0/capacity"; echo "Not charging" > "$_BATTERY_PS_ROOT/BAT0/status"
+echo 70 > "$_BATTERY_PS_ROOT/BAT0/charge_control_end_threshold"
+echo 98 > "$_BATTERY_PS_ROOT/BAT1/capacity"; echo "Discharging" > "$_BATTERY_PS_ROOT/BAT1/status"
+# A wireless-mouse battery: type Battery but scope Device — must be ignored.
+echo Battery > "$_BATTERY_PS_ROOT/hidpp_battery_0/type"; echo Device > "$_BATTERY_PS_ROOT/hidpp_battery_0/scope"
+echo 5 > "$_BATTERY_PS_ROOT/hidpp_battery_0/capacity"
+bat_sample="$(_battery_sample_cmd 2>/dev/null || true)"
+if [[ "$bat_sample" == $'BAT0 69 Not_charging 1 70\nBAT1 98 Discharging 1 -' ]]; then
+    test_result "Battery: default sampler reads sysfs, skips device batteries" "pass"
+else
+    test_result "Battery: default sampler reads sysfs, skips device batteries" "fail"
+fi
+
+# --- Default sampler with no power_supply dir → empty, exit 0 (set -e safe) ---
+_BATTERY_PS_ROOT="$TEST_TMP/does-not-exist"
+if bat_sample="$(_battery_sample_cmd)" && [[ -z "$bat_sample" ]]; then
+    test_result "Battery: sampler with no sysfs → empty output, exit 0" "pass"
+else
+    test_result "Battery: sampler with no sysfs → empty output, exit 0" "fail"
+fi
+unset _BATTERY_PS_ROOT
+
+# --- Wiring: config defaults are all-off, and the cycle calls battery_check ---
+if ( source "$PROJECT_DIR/etc/anomalous-mon.conf" \
+     && [[ -z "${BATTERY_LOW_PCT-x}" && -z "${BATTERY_HIGH_PCT-x}" && -z "${BATTERY_EXPECT_END_THRESHOLD-x}" ]] ) \
+   && grep -q '^battery_check ' "$PROJECT_DIR/bin/anomalous-mon"; then
+    test_result "Battery: shipped config is opt-in (all empty) and wired into the cycle" "pass"
+else
+    test_result "Battery: shipped config is opt-in (all empty) and wired into the cycle" "fail"
+fi
+
 # --- Project structure exists ---
 for f in bin lib etc test; do
     if [[ -d "$PROJECT_DIR/$f" ]]; then
@@ -1656,7 +1837,7 @@ for f in bin lib etc test; do
     fi
 done
 
-for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/memory-monitor.sh lib/stale-files-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
+for f in lib/cpu-monitor.sh lib/journal-monitor.sh lib/disk-monitor.sh lib/memory-monitor.sh lib/battery-monitor.sh lib/stale-files-monitor.sh lib/notify.sh etc/anomalous-mon.conf; do
     if [[ -f "$PROJECT_DIR/$f" ]]; then
         test_result "File $f exists" "pass"
     else

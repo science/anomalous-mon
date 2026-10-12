@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 107 checks.
+- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 122 checks.
 - **Run the live tests:** `./test/test-live.sh` (opt-in; also gated by `ANOMALOUS_MON_LIVE_TESTS=1`). Exercises the **real** samplers (pidstat/df/`/proc`/journalctl/find) plus true end-to-end: spawns a real growing process and asserts a `mem:runaway` alert fires through the real `/proc` sampler (and reads the message back), and runs a real OOM inside a `runcapped` scope to confirm containment. Needs `pidstat`, user `systemd-run`, `python3`, a journal; briefly allocates a few hundred MB. This is the layer the mocked suite can't cover.
 - **Run a single test:** there's no test selector. The suite is a single bash file with inline assertions; comment out sections you don't want to run, or copy the `reset_test_state` + assertion block into a scratch script that sources the libs.
 - **Run one monitoring cycle manually:** `bin/anomalous-mon` (with no args). This is what the systemd timer invokes — safe to run ad-hoc.
@@ -114,6 +114,16 @@ Proactive — fires *before* the kernel OOM killer, unlike the journal OOM detec
 **Sampling** (`_memory_sample_cmd`, overridable via `_MEM_SAMPLE_CMD`; `set_mock_memory` in tests). Emits one `sys <mem_total_kb> <mem_avail_kb> <swap_total_kb> <swap_free_kb> <psi_full_avg60>` line (from `/proc/meminfo` + `/proc/pressure/memory`) followed by `proc <pid> <rss_kb> <comm>` lines (one awk pass over `/proc/[0-9]*/status`; kernel threads with no `VmRSS` are skipped). The awk pass carries a load-bearing `|| true` (same class as the df guard): a process exiting between glob expansion and awk opening its file makes mawk/gawk die fatally with exit 2, which under `set -e` killed whole cycles intermittently on t480 (FINDINGS-mem-sampler-proc-race-2026-07-20.md). `_MEM_PROC_ROOT` overrides the `/proc` root as the regression-test seam. The per-PID trend state tracks *every* process so growth can be measured from first sighting; PID reuse just resets the streak (new tiny RSS < prev + tick). `_MEM_NOW` overrides the clock for cooldown tests.
 
 **The mitigation companion is `bin/runcapped`** — wrap a heavy job in a memory-capped systemd scope so an OOM kills only the job, not the desktop. See "Standalone tool" below. The monitor *warns*; `runcapped` *contains*.
+
+### Battery monitoring (`lib/battery-monitor.sh`)
+
+**Opt-in per host** — written for a laptop that runs 24/7 on AC as a server (t480-server) with its charge capped below 100% for pack longevity. The tracked config ships all three settings empty; with all three empty `battery_check` returns before sampling, so desktops and everyday laptops are untouched. A host enables checks in `etc/anomalous-mon.conf.local`. Three independent checks per pack, each with its own key `battery:<pack>:<check>` and a shared `BATTERY_COOLDOWN`:
+
+- **low** — capacity < `BATTERY_LOW_PCT`. The message distinguishes *AC offline* (running on battery: breaker trip or outage) from *AC online* (the pack is not charging back up: charge-cap/EC fault or a failing pack).
+- **high** — capacity > `BATTERY_HIGH_PCT`: the charge cap is not holding. Don't enable it until the packs are actually below it, or it fires immediately.
+- **threshold** — `charge_control_end_threshold` != `BATTERY_EXPECT_END_THRESHOLD`: the cap itself was lost (EC reset, unit not applied). The leading indicator — *high* only notices after the pack has charged past the cap.
+
+**Sampling** (`_battery_sample_cmd`; `_BATTERY_SAMPLE_CMD` mock, `_BATTERY_PS_ROOT` fake-sysfs seam, `_BATTERY_NOW` clock seam) reads `/sys/class/power_supply`: `type == Battery` and `scope != Device` (a wireless mouse is also a power_supply "Battery"), status spaces → underscores, AC = any `Mains` supply online, `-` when the pack has no threshold support. Wrapped in `{ …; } || true` per the sampler rule (FINDINGS-mem-sampler-proc-race-2026-07-20.md).
 
 ### Stale large-files monitor (`lib/stale-files-monitor.sh`)
 
