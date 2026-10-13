@@ -25,10 +25,18 @@
 
 # Fstypes to exclude at the sampler level and as a belt-and-suspenders filter
 # inside disk_check (in case a future sample source leaks one through).
-_DISK_EXCLUDE_FSTYPES="tmpfs devtmpfs squashfs overlay efivarfs fuse.portal fuse.rclone fuse.snapfuse autofs nfs nfs4 cifs smbfs virtiofs"
+# Entries are bash glob patterns. `fuse.*` covers every userspace FUSE mount
+# (rclone, gvfs, xdg portal, snapfuse, lxcfs, sshfs, and each AppImage, whose
+# fstype is "fuse.<appimage-filename>" and so differs per app and version).
+# None of those are local disks you can fill. It deliberately does NOT match
+# `fuseblk`, which is a real block device (NTFS/exFAT USB drives).
+# iso9660 is a mounted ISO/CD image: read-only and always 100% full.
+_DISK_EXCLUDE_FSTYPES="tmpfs devtmpfs squashfs overlay efivarfs fuse.* iso9660 autofs nfs nfs4 cifs smbfs virtiofs"
 
 # Default sampler: df, POSIX output, excluding pseudo/virtual/network fstypes.
 # Emits: "<target> <fstype> <pcent_no_%> <avail_kb>" one per real filesystem.
+# `df -x` only takes exact fstype names, so the fuse.* family is dropped in
+# the awk stage instead.
 #
 # df exits non-zero when ANY mount can't be stat'd — e.g. a dead fuse mount
 # ("Transport endpoint is not connected"), common debris after an OOM kills a
@@ -39,10 +47,9 @@ _DISK_EXCLUDE_FSTYPES="tmpfs devtmpfs squashfs overlay efivarfs fuse.portal fuse
 _disk_sample_cmd() {
     { df --output=target,fstype,pcent,avail \
         -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs \
-        -x fuse.portal -x fuse.rclone -x fuse.snapfuse \
-        -x autofs -x nfs -x nfs4 -x cifs -x smbfs -x virtiofs \
+        -x iso9660 -x autofs -x nfs -x nfs4 -x cifs -x smbfs -x virtiofs \
         2>/dev/null \
-      | awk 'NR>1 { gsub(/%/,"",$3); print $1, $2, $3, $4 }'; } || true
+      | awk 'NR>1 && $2 !~ /^fuse\./ { gsub(/%/,"",$3); print $1, $2, $3, $4 }'; } || true
 }
 
 # Load disk alert state into _DISK_ALERTED (key → epoch).
@@ -100,12 +107,17 @@ _disk_alert_record() {
     _DISK_ALERTED[$key]="$(date +%s)"
 }
 
-# Return 0 if the fstype is in our exclusion list.
+# Return 0 if the fstype matches a pattern in our exclusion list.
+# `read -a` splits without pathname expansion, so `fuse.*` can't glob
+# against files in the cwd; the unquoted RHS of == makes it a pattern.
 _disk_fstype_excluded() {
     local fstype="$1"
+    local -a patterns
     local f
-    for f in $_DISK_EXCLUDE_FSTYPES; do
-        [[ "$fstype" == "$f" ]] && return 0
+    read -ra patterns <<< "$_DISK_EXCLUDE_FSTYPES"
+    for f in "${patterns[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$fstype" == $f ]] && return 0
     done
     return 1
 }

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 122 checks.
+- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 123 checks.
 - **Run the live tests:** `./test/test-live.sh` (opt-in; also gated by `ANOMALOUS_MON_LIVE_TESTS=1`). Exercises the **real** samplers (pidstat/df/`/proc`/journalctl/find) plus true end-to-end: spawns a real growing process and asserts a `mem:runaway` alert fires through the real `/proc` sampler (and reads the message back), and runs a real OOM inside a `runcapped` scope to confirm containment. Needs `pidstat`, user `systemd-run`, `python3`, a journal; briefly allocates a few hundred MB. This is the layer the mocked suite can't cover.
 - **Run a single test:** there's no test selector. The suite is a single bash file with inline assertions; comment out sections you don't want to run, or copy the `reset_test_state` + assertion block into a scratch script that sources the libs.
 - **Run one monitoring cycle manually:** `bin/anomalous-mon` (with no args). This is what the systemd timer invokes — safe to run ad-hoc.
@@ -98,7 +98,7 @@ Two severities per mount, computed fresh each tick from `df --output=target,fsty
 
 **Per-mount overrides** via `DISK_THRESHOLD_OVERRIDES` in the config, formatted `"warn:crit:min_free_gb"` with `-` to inherit. `/boot` and `/boot/efi` ship with tightened overrides because they legitimately run 70-80% full.
 
-**Fstype filtering** is belt-and-suspenders: the sampler passes `-x` flags to df (tmpfs, squashfs, efivarfs, overlay, fuse.*, autofs, nfs, cifs, virtiofs, …), and `disk_check` re-checks the fstype column against `_DISK_EXCLUDE_FSTYPES` in case a mock or future sample source leaks a pseudo fs through.
+**Fstype filtering** is belt-and-suspenders: the sampler passes `-x` flags to df (tmpfs, squashfs, efivarfs, overlay, iso9660, autofs, nfs, cifs, virtiofs, …) and drops every `fuse.*` type in its awk stage (`df -x` only takes exact names, and AppImages mount as `fuse.<appimage-filename>`, a different type per app), and `disk_check` re-checks the fstype column against the glob patterns in `_DISK_EXCLUDE_FSTYPES` in case a mock or future sample source leaks a pseudo fs through. `fuseblk` (NTFS/exFAT USB drives) is a real disk and is *not* excluded.
 
 **Float comparisons.** Bash `(( ))` can't compare floats, and `MIN_FREE_GB` can be fractional (e.g. `0.1` for `/boot`). `_disk_lt` and `_disk_kb_to_gb` shell out to `awk` for the float work; the integer comparisons (pcent vs. warn/crit) stay in native bash.
 

@@ -478,6 +478,23 @@ else
     test_result "Disk fstype filter: excluded fstypes ignored even at 99%" "fail"
 fi
 
+# --- Fstype filter: any fuse.* (AppImage, gvfs, lxcfs…) ignored; fuseblk is a real disk ---
+# AppImages mount as "fuse.<appimage-filename>", so the type varies per app;
+# they are read-only and always report 100% / 0 free.
+reset_test_state
+rm -f "$TEST_TMP/disk.alerts"
+set_mock_disk "/tmp/.mount_audacikPHcnE fuse.audacity-linux-4.0.1-x86_64.AppImage 100 0
+/run/user/1000/gvfs fuse.gvfsd-fuse 100 0
+/var/lib/lxcfs fuse.lxcfs 100 0
+/media/cdrom iso9660 100 0
+/media/usb fuseblk 99 100"
+disk_check "$TEST_TMP/disk.alerts" 80 92 10 1800 300
+if [[ "$ALERT_LOG" == *"/media/usb"* && "$ALERT_LOG" != *"fuse."* && "$ALERT_LOG" != *"iso9660"* ]]; then
+    test_result "Disk fstype filter: fuse.* and iso9660 ignored, fuseblk still alerts" "pass"
+else
+    test_result "Disk fstype filter: fuse.* and iso9660 ignored, fuseblk still alerts" "fail"
+fi
+
 # --- Empty df output → no crash, no alert ---
 reset_test_state
 rm -f "$TEST_TMP/disk.alerts"
