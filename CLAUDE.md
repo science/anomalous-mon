@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 123 checks.
+- **Run tests:** `./test/test-anomalous-mon.sh` — pass/fail suite, no side effects (all I/O mocked, redirected to `$(mktemp -d)`). 133 checks.
 - **Run the live tests:** `./test/test-live.sh` (opt-in; also gated by `ANOMALOUS_MON_LIVE_TESTS=1`). Exercises the **real** samplers (pidstat/df/`/proc`/journalctl/find) plus true end-to-end: spawns a real growing process and asserts a `mem:runaway` alert fires through the real `/proc` sampler (and reads the message back), and runs a real OOM inside a `runcapped` scope to confirm containment. Needs `pidstat`, user `systemd-run`, `python3`, a journal; briefly allocates a few hundred MB. This is the layer the mocked suite can't cover.
 - **Run a single test:** there's no test selector. The suite is a single bash file with inline assertions; comment out sections you don't want to run, or copy the `reset_test_state` + assertion block into a scratch script that sources the libs.
 - **Run one monitoring cycle manually:** `bin/anomalous-mon` (with no args). This is what the systemd timer invokes — safe to run ad-hoc.
@@ -85,6 +85,13 @@ Pattern-matches `MESSAGE` fields against `/Out of memory|oom-kill|Killed process
 
 Self-feed filter: journal entries whose `_SYSTEMD_USER_UNIT == "anomalous-mon.service"` are skipped — otherwise our own `[ALERT] oom: …` log lines would match the OOM regex and retrigger.
 
+**Two passes** (`journal_check`):
+
+- **User journal** (`_journal_cmd`, mock `_JOURNAL_CMD`): `journalctl --user`, readable without privileges, tracked by the cursor file.
+- **System + kernel journal** (`_journal_system_cmd`, mock `_JOURNAL_SYSTEM_CMD`): steve is deliberately **not** in `systemd-journal` (that would expose all system logs, the kernel log despite `dmesg_restrict`, and the `test` user's journal to every process running as steve). Instead the yadm sudoers rule `~/.config/yadm/sudoers.d/anomalous-mon-journal` allows exactly one command, the `_JOURNAL_SYSTEM_ARGV` array, run as `sudo -n -g systemd-journal` (steve's uid, journal group, never root), NOPASSWD, NOEXEC, logging off. **sudo matches the arguments literally: change the array and the sudoers file must change identically** (yadm's `test-dotfiles.sh` sources the array and checks it is allowed and that variants are refused). Keep `--grep` last and `--no-pager` in (without it `less` would be a shell escape). The query has a fixed `--since=-10min` window because a changing cursor argument can't be matched safely, so this pass de-duplicates by `__REALTIME_TIMESTAMP` (µs) kept in `<cursor>.system-ts`; cold start uses `now - OOM_LOOKBACK` (`_JOURNAL_NOW` is the clock seam). If the rule file is absent the pass is skipped without calling sudo (a refused `sudo -n` would log every 5 s). `journalctl --grep` exits 1 on "no matches", so the call carries `|| true` (same `set -e` class as the df/proc guards).
+
+**sudo audit-line filter:** entries with `SYSLOG_IDENTIFIER == sudo` are skipped. sudo logs refused command lines into steve's user journal, and a refused variant of the system query quotes its own `--grep` pattern (`oom-kill`, `memory.max`), which produced false OOM alerts on 2026-11-02.
+
 Kernel `Out of memory: Killed process N (name) …` lines contain the victim's real process name; the scope-level `Failed with result 'oom-kill'` lines do not. The OOM detector currently parses both but the victim-name extraction only works on the kernel line.
 
 ### Disk-space monitoring (`lib/disk-monitor.sh`)
@@ -161,6 +168,7 @@ The libs are designed to be sourced and mocked:
 
 - `_CPU_SAMPLE_CMD` — override `_cpu_sample_cmd` with a function returning fake `pid %cpu comm args` lines. `set_mock_ps "..."` is a convenience helper.
 - `_JOURNAL_CMD` — override `_journal_cmd` with a function returning fake journalctl JSON.
+- `_JOURNAL_SYSTEM_CMD` — override `_journal_system_cmd` (the sudo-allowed system-journal query). The journal tests set it to an empty mock by default so the suite never calls the real `sudo`. `_JOURNAL_NOW` fixes the clock for its cold-start cutoff.
 - `_DISK_SAMPLE_CMD` — override `_disk_sample_cmd` with a function returning fake `target fstype pcent avail_kb` lines (one per mount). `set_mock_disk "..."` is the convenience helper.
 - `_STALE_FILES_SCAN_CMD` — override `_stale_files_scan_cmd` with a function returning fake `size_bytes<TAB>mtime_epoch<TAB>path` lines. `set_mock_stale "..."` is the convenience helper.
 - `_STALE_FINDMNT_CMD` — override `_stale_findmnt_cmd` for mount-prune testing. Emits `target<SPACE>fstype` lines. `set_mock_findmnt "..."` is the convenience helper.
@@ -182,6 +190,7 @@ All under `${XDG_RUNTIME_DIR:-/tmp}`:
 |---|---|---|
 | `anomalous-mon.state` | CPU dual-track counters + alerted flags | line-based: `pid:<PID>:<NAME>:<COUNT>:<ALERTED>:<ARGS>` or `name:<NAME>:<COUNT>:<ALERTED>` |
 | `anomalous-mon.cursor` | last journalctl cursor | single line, opaque cursor token |
+| `anomalous-mon.cursor.system-ts` | system-journal pass: newest entry handled | single line, `__REALTIME_TIMESTAMP` in µs |
 | `anomalous-mon.oom-alerts` | OOM cooldown state | `<key>:<epoch>` per line |
 | `anomalous-mon.disk-alerts` | Disk WARN/CRITICAL cooldown state | `disk:<mount>:<severity>:<epoch>` per line; `<severity>` is `warn` or `critical`. Parsed with `${line%:*}` / `${line##*:}` so a key with embedded colons like `disk:/:warn` still splits correctly. |
 | `anomalous-mon.mem-state` | Memory: per-PID runaway-growth trend (Signal B) | `pid:<PID>:<NAME>:<LAST_RSS_KB>:<STREAK>:<ALERTED>` per line |

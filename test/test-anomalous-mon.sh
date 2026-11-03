@@ -802,6 +802,11 @@ echo ""
 echo "=== Journal Monitor Tests ==="
 echo ""
 
+# The system-journal pass would otherwise run the real sudo; mock it out for
+# every journal test (tests below override it where they exercise it).
+_mock_journal_sys_none() { :; }
+_JOURNAL_SYSTEM_CMD="_mock_journal_sys_none"
+
 # --- No OOM events → no alert ---
 reset_test_state
 _JOURNAL_CMD="_mock_journal_empty"
@@ -914,6 +919,132 @@ if [[ "$ALERT_LOG" == *"rclone"* ]]; then
 else
     test_result "OOM cooldown: alert fires again after cooldown expires" "fail"
 fi
+
+# --- sudo's own log lines are ignored: they quote command lines, which can
+#     contain the matched words (the sudo-allowed query's own --grep pattern) ---
+reset_test_state
+_JOURNAL_CMD="_mock_journal_sudo_log"
+_mock_journal_sudo_log() {
+    echo '{"__CURSOR":"cursor4","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"   steve : a password is required ; USER=root ; COMMAND=/usr/bin/journalctl --system --grep=Out.of.memory|oom-kill|Killed.process|memory.max|MemoryMax|memory.limit","_SYSTEMD_UNIT":"user@1000.service"}'
+}
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "sudo log lines quoting OOM words are ignored" "pass"
+else
+    test_result "sudo log lines quoting OOM words are ignored" "fail"
+fi
+
+# ── System journal pass (sudo rule: sudoers.d/anomalous-mon-journal) ──
+# steve can't read the system/kernel journal directly; a sudoers rule allows
+# one fixed, --grep-filtered journalctl query. Its window is a fixed 10 min, so
+# entries are de-duplicated by __REALTIME_TIMESTAMP (µs) kept in <cursor>.system-ts.
+
+SYS_NOW=2000000000                       # fixed clock (seconds)
+SYS_TS_NEW=$(( (SYS_NOW - 30) * 1000000 ))   # 30 s ago: inside the cold-start window
+SYS_TS_OLD=$(( (SYS_NOW - 600) * 1000000 ))  # 10 min ago: outside "2 minutes"
+_mock_journal_sys_oom() {
+    echo '{"__CURSOR":"s=sys;i=1","__REALTIME_TIMESTAMP":"'"$SYS_TS_NEW"'","MESSAGE":"Out of memory: Killed process 4321 (python3) total-vm:9000000kB","_TRANSPORT":"kernel"}'
+}
+_mock_journal_sys_old() {
+    echo '{"__CURSOR":"s=sys;i=0","__REALTIME_TIMESTAMP":"'"$SYS_TS_OLD"'","MESSAGE":"Out of memory: Killed process 1111 (oldproc) total-vm:1kB","_TRANSPORT":"kernel"}'
+}
+_mock_journal_sys_fail() { return 1; }
+
+# --- Kernel OOM from the system journal → alert ---
+reset_test_state
+rm -f "$TEST_TMP/journal.cursor.system-ts"
+_JOURNAL_CMD="_mock_journal_empty"
+_JOURNAL_SYSTEM_CMD="_mock_journal_sys_oom"
+_JOURNAL_NOW=$SYS_NOW
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if [[ "$ALERT_LOG" == *"oom:python3"* ]]; then
+    test_result "System journal: kernel OOM kill → alert with process name" "pass"
+else
+    test_result "System journal: kernel OOM kill → alert with process name" "fail"
+fi
+
+# --- System pass records the newest timestamp it processed ---
+if [[ "$(cat "$TEST_TMP/journal.cursor.system-ts" 2>/dev/null)" == "$SYS_TS_NEW" ]]; then
+    test_result "System journal: newest processed timestamp saved to <cursor>.system-ts" "pass"
+else
+    test_result "System journal: newest processed timestamp saved to <cursor>.system-ts" "fail"
+fi
+
+# --- System entries never move the user-journal cursor ---
+if [[ ! -f "$TEST_TMP/journal.cursor" ]]; then
+    test_result "System journal: user cursor file untouched by system entries" "pass"
+else
+    test_result "System journal: user cursor file untouched by system entries" "fail"
+fi
+
+# --- Same entry on the next run (still inside the 10 min window) → no alert ---
+ALERT_LOG=""
+_ACTIVE_ALERTS=()
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "System journal: entry already processed → not re-alerted" "pass"
+else
+    test_result "System journal: entry already processed → not re-alerted" "fail"
+fi
+
+# --- Cold start ignores entries older than the lookback ---
+reset_test_state
+rm -f "$TEST_TMP/journal.cursor.system-ts"
+_JOURNAL_SYSTEM_CMD="_mock_journal_sys_old"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if [[ -z "$ALERT_LOG" ]]; then
+    test_result "System journal: cold start ignores entries older than lookback" "pass"
+else
+    test_result "System journal: cold start ignores entries older than lookback" "fail"
+fi
+
+# --- A failing system query (rule missing / sudo refused) doesn't abort the
+#     cycle (this suite runs under set -e) and the user pass still alerts ---
+reset_test_state
+rm -f "$TEST_TMP/journal.cursor.system-ts"
+_JOURNAL_CMD="_mock_journal_oom"
+_JOURNAL_SYSTEM_CMD="_mock_journal_sys_fail"
+journal_check "$TEST_TMP/journal.cursor" "2 minutes"
+if [[ "$ALERT_LOG" == *"oom:rclone"* ]]; then
+    test_result "System journal: failing query doesn't abort; user pass still alerts" "pass"
+else
+    test_result "System journal: failing query doesn't abort; user pass still alerts" "fail"
+fi
+unset _JOURNAL_NOW
+
+# --- _journal_system_cmd: no sudoers rule → no sudo call, no output, rc 0 ---
+SUDO_CALLS=""
+sudo() { SUDO_CALLS+="$*;"; return 1; }
+sys_out="$(JOURNAL_SUDOERS_RULE="$TEST_TMP/no-such-rule" _journal_system_cmd)"; sys_rc=$?
+if [[ -z "$SUDO_CALLS" && -z "$sys_out" && $sys_rc -eq 0 ]]; then
+    test_result "_journal_system_cmd: rule absent → skips sudo entirely" "pass"
+else
+    test_result "_journal_system_cmd: rule absent → skips sudo entirely" "fail"
+fi
+
+# --- _journal_system_cmd: rule present → sudo -n -g systemd-journal + the fixed
+#     argv, and a refusal (rc 1) still returns 0 ---
+touch "$TEST_TMP/rule"
+sudo() { echo "$*" > "$TEST_TMP/sudo.args"; return 1; }
+JOURNAL_SUDOERS_RULE="$TEST_TMP/rule" _journal_system_cmd >/dev/null; sys_rc=$?
+expected="-n -g systemd-journal ${_JOURNAL_SYSTEM_ARGV[*]}"
+if [[ "$(cat "$TEST_TMP/sudo.args")" == "$expected" && $sys_rc -eq 0 ]]; then
+    test_result "_journal_system_cmd: runs sudo -n -g systemd-journal with the fixed query" "pass"
+else
+    test_result "_journal_system_cmd: runs sudo -n -g systemd-journal with the fixed query" "fail"
+fi
+unset -f sudo
+
+# --- The fixed query keeps the properties the sudoers rule relies on ---
+argv=" ${_JOURNAL_SYSTEM_ARGV[*]} "
+if [[ "${_JOURNAL_SYSTEM_ARGV[0]}" == /usr/bin/journalctl && "$argv" == *" --system "* \
+      && "$argv" == *" --no-pager "* && "${_JOURNAL_SYSTEM_ARGV[-1]}" == --grep=* \
+      && "$argv" != *" --user "* ]]; then
+    test_result "Fixed journal query: absolute path, --system, --no-pager, --grep last, no --user" "pass"
+else
+    test_result "Fixed journal query: absolute path, --system, --no-pager, --grep last, no --user" "fail"
+fi
+_JOURNAL_SYSTEM_CMD="_mock_journal_sys_none"
 
 # ── Notification Tests ────────────────────────────────────────────────
 

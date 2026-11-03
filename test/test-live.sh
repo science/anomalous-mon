@@ -109,6 +109,23 @@ fi
 check "Journal sampler (real journalctl -o json) returns 0 and emits valid JSON" "$jr_ok" \
       "rc=$jr_rc"
 
+# --- System journal sampler: the sudo-allowed query (yadm sudoers.d/anomalous-mon-journal).
+# journalctl --grep exits 1 on "no matches", so judge sudo by its own error text.
+# `sudo -k` ignores cached credentials: only the NOPASSWD rule can make this pass.
+if [[ -e "$JOURNAL_SUDOERS_RULE" ]]; then
+    sj_err="$(sudo -k -n -g systemd-journal "${_JOURNAL_SYSTEM_ARGV[@]}" 2>&1 >/dev/null || true)"
+    sj_ok=ok
+    [[ "$sj_err" == *sudo:* ]] && sj_ok=bad
+    sj_first="$(grep -m1 . <<<"$(_journal_system_cmd)" || true)"
+    if [[ -n "$sj_first" ]]; then
+        python3 -c 'import json,sys; json.loads(sys.argv[1])' "$sj_first" 2>/dev/null || sj_ok=bad
+    fi
+    check "System journal sampler: sudo rule allows the fixed query, output is valid JSON" "$sj_ok" \
+          "sudo said: $sj_err"
+else
+    echo "  - skip: system journal sampler ($JOURNAL_SUDOERS_RULE not installed)"
+fi
+
 # --- Stale sampler: real find over a temp root with a planted old file ---
 stale_root="$TMP/staleroot"; mkdir -p "$stale_root"
 printf 'data' > "$stale_root/planted.bin"

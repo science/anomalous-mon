@@ -10,7 +10,7 @@ Built after an rclone mount grew to 1.9GB RSS and entered a GC loop at 193% CPU 
 
 **Sustained CPU hogging** — Samples top CPU consumers every 60 seconds. Uses dual-track state (PID table + process name table) to catch both stuck processes and crash-looping services with rotating PIDs. Alerts after 5 consecutive samples above 25% CPU.
 
-**OOM kills and memory limit hits** — Checks journalctl for OOM-kill events and cgroup `memory.max` hits. Tracks journal cursor to avoid re-alerting on old events.
+**OOM kills and memory limit hits** — Checks journalctl for OOM-kill events and cgroup `memory.max` hits. Your own services come from the user journal (tracked by cursor). Kernel OOM kills and system services come from the system journal, which an ordinary user can't read: a narrow sudoers rule (yadm `sudoers.d/anomalous-mon-journal`) allows one fixed, `--grep`-filtered `journalctl` query for it, run with group `systemd-journal` and no PIN. Without that rule only the user journal is checked. See `PLAN-system-journal-access.md`.
 
 **Laptop battery (opt-in)** — For a laptop running 24/7 on AC as a server with its charge capped. Alerts when a pack drops below `BATTERY_LOW_PCT` (saying whether AC is offline or the pack just isn't charging), rises above `BATTERY_HIGH_PCT`, or its charge-stop threshold drifts from `BATTERY_EXPECT_END_THRESHOLD`. All three ship empty (disabled); enable per host in `etc/anomalous-mon.conf.local`.
 
@@ -113,7 +113,7 @@ pytest test/test_rclone_cycle_scan.py          # python: rclone-cycle-scan detec
 ANOMALOUS_MON_LIVE_TESTS=1 ./test/test-live.sh # live: real samplers + real end-to-end alerting
 ```
 
-The main bash suite (103 checks) covers CPU dual-track logic, journal monitoring, disk WARN/CRITICAL severity gating (including df-exit-code resilience to dead mounts), memory pressure + per-process runaway-growth detection, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios. It uses **mocked samplers**, so it runs anywhere and has no side effects.
+The main bash suite (133 checks) covers CPU dual-track logic, journal monitoring, disk WARN/CRITICAL severity gating (including df-exit-code resilience to dead mounts), memory pressure + per-process runaway-growth detection, notification deduplication, grouped replace-id collapsing, state file recovery, and integration scenarios. It uses **mocked samplers**, so it runs anywhere and has no side effects.
 
 `test/test-live.sh` is the **opt-in** complement: it runs each *real* sampler against the live machine (catching pidstat/df/`/proc`/journalctl format drift), spawns a real growing process and asserts a `mem:runaway` alert actually fires through the real `/proc` sampler (reading the alert text back), and runs a real OOM inside a `runcapped` scope to confirm containment. It needs `pidstat`, user `systemd-run`, `python3`, and a journal, and briefly allocates a few hundred MB — hence it's separate from the always-on suite.
 
